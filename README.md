@@ -1,2 +1,3 @@
-# teb
-🐟 tphp.rt web 框架
+# tphp/teb
+
+`tphp` library package.

@@ -1,0 +1,11 @@
+{
+  "name": "tphp/teb",
+  "version": "0.0.1",
+  "type": "lib",
+  "license": "MIT",
+  "autoload": {
+    "psr-4": {
+      "Tphp\\Teb\\": "src/"
+    }
+  }
+}
