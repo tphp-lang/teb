@@ -25,22 +25,20 @@ class Web extends Base
         return $this;
     }
 
-    public function request(string $uri, callable $cb): self
+    /**
+     * 路由
+     *
+     * @param string $uri 路径
+     * @param callable(Request):Response $cb 回调
+     * @return self
+     */
+    public function route(string $uri, callable $cb): self
     {
-        // civetweb 在 worker 线程回调此闭包，经跨线程 marshaling 投递到主线程执行。
-        // 契约：$cb 返回响应体字符串；本层拼 HTTP 响应头并 mg_write；
-        // 返回 1（已处理）交还 civetweb，否则它按未处理回 404。
         $c_cb = function ($conn, $cbdata) use ($cb) {
-            $body = $cb($conn);
-            if (!is_string($body)) {
-                $body = "";
-            }
-            $resp = "HTTP/1.1 200 OK\r\n"
-                  . "Content-Type: text/plain\r\n"
-                  . "Content-Length: " . strlen($body) . "\r\n"
-                  . "Connection: close\r\n\r\n"
-                  . $body;
-            self::ffi()->mg_write($conn, $resp, strlen($resp));
+            $request_info = new Request($conn);
+            $resp = $cb($request_info);
+            $send = $resp->send();
+            self::ffi()->mg_write($conn, $send, strlen($send));
             return 1;
         };
         self::ffi()->mg_set_request_handler($this->ctx, $uri, $c_cb, null);

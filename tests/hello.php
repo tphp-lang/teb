@@ -3,12 +3,14 @@
 require __DIR__ . "/../vendor/autoload.php";
 
 use Tphp\Teb\Web;
+use Tphp\Teb\Response;
+use Tphp\Teb\Request;
 
 $web = new Web();
 $web->start(8080);
-$web->request("/hello", function ($conn) {
-    var_dump($conn);
-    return "hello from Tphp\Teb";
+$web->route("/hello", function (Request $request) {
+    // var_dump($request->method());
+    return new Response("hello from Tphp\Teb");
 })
     ->run()
     ->stop();
