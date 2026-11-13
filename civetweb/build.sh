@@ -1,1 +1,0 @@
-TARCH=${TARGET_ARCH:-$(uname -m)}
