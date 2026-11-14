@@ -154,8 +154,9 @@ grep -q "phase2-started" "$LOG" && check "phase2 restart ok" "ok" "ok" || check 
 check "stop in callback response" "stopping" "$(curlp "$BASE/stop-in-callback")"
 sleep 2
 grep -q "run-exited" "$LOG" && check "run() exited after pending_stop" "ok" "ok" || check "run() exited after pending_stop" "ok" "missing"
-# p0-done 依赖脚本自然退出——引擎 main-frame 槽幽灵引用问题会导致退出段错误
-# （见 doc/P0-plan.md 教训节；进程由 kill 收尾，p0-done 打出与否不作断言）
+# p0-done 依赖脚本自然退出——引擎帧 TMP 槽幽灵引用 bug（独立存在，2026-11-14
+# 复现步骤见 doc/P0-plan.md 教训节引擎 bug #2）导致自然退出段错误，
+# 规避不可解除：本套件以 kill 收尾，p0-done 打出与否不作硬断言
 grep -q "p0-done" "$LOG" && check "idempotent stop after run exit" "ok" "ok" || check "idempotent stop after run exit" "ok" "missing"
 
 kill $PID 2>/dev/null
