@@ -17,17 +17,30 @@
 
 ## 调研事实（实现时直接用，勿重复调研）
 
+> 2026-11-14 已用桌面源码（C:\Users\28249\Desktop\civetweb-master，1.17，与 teb/civetweb 逐字节同源）逐条核验，全部成立。
+
 - 引擎 `T_NULL=0`（零初始化即 NULL 哨兵）；props 槽 `tphp_obj_alloc` 置 defval、
   `tobj_free`（mem.c:307）逐槽 tval_release。native 静态方法引擎原生支持
   （vm.c:3507 → 1571-1574，`self=NULL`，返回值 +1 所有权转移 vm.c:1587）。
 - civetweb `mg_handle_form_request` / `mg_form_data_handler`（civetweb.h:1202-1303）：
-  - `field_found` 的 filename **恒非 NULL**，无文件时为 `""`（handle_form.inl:60-65）
-    → 空文件不可区分。
+  - `field_found` 的 filename **恒非 NULL**，无文件时为 `""`
+    （url_encoded_field_found：filename==NULL → filename_dec[0]=0 后统一传本地
+    filename_dec；multipart 无 filename 同走此路）→ 空文件不可区分。
   - `field_get` 分块、非 NUL 结尾 → 按 valuelen 累积；返回 HANDLE_GET=继续 /
-    HANDLE_NEXT=完 / HANDLE_ABORT=中止（query/urlencoded 路径每字段只调一次，
-    返回 HANDLE_GET 安全）。
-  - `field_store(path,size)` 完整落盘才回调；fopen 失败/部分上传不回调。
-  - path 是 mg 内部 `char path[512]` 栈缓冲 → tmp 路径 <512B。
+    HANDLE_NEXT=完 / HANDLE_ABORT=中止（civetweb.h:1285-1298）。
+    **multipart 续块 key=NULL、keylen=0**（handle_form.inl:989-995，get_block>0 分支）
+    → FormCtx 累积逻辑必须判 key==NULL = 当前字段续块；首块 key 已 url_decode，
+    value 恒为原始字节（二进制安全）。
+  - query/urlencoded 路径每字段只调一次（url_encoded_field_get 完整解码），
+    返回 HANDLE_GET 安全。
+  - `field_store(path,size)` 完整落盘才回调；fwrite 失败/部分上传
+    remove_bad_file 清理不回调（civetweb.h:1273-1276 注释明示）。
+  - path 是 mg 内部 `char path[512]` 栈缓冲（handle_form.inl:200），
+    回调收 sizeof-1=511 → tmp 路径 <512B。
+  - 返回值=处理字段数，<0=错误；**已 STORE 成功的文件调用方负责删除**
+    （部分成功后中止同样返回 <0，tmp 回收必须覆盖此路径）。
+    POST 无 body（content_length=0 且非 chunked）且 method≠GET → -1；
+    GET 无 query_string → -1（form() 需区分 0 字段与无效请求）。
 - PHP 上传错误码（本机 php 实测）：OK=0 INI=1 FORM=2 PARTIAL=3 NO_FILE=4
   NO_TMP_DIR=6 CANT_WRITE=7 EXTENSION=8。
 - `mg_get_builtin_mime_type` / `mg_url_decode` / `mg_get_header` / `mg_get_response_code_text`
@@ -73,3 +86,17 @@
   → find_method 解引用垃圾 = 随机 AV）。
 - add_native 类构建 helper 用 teb.c 现有版本（勿改回 &ms[1] 那版）。
 - 引擎 vm.c 调试断点用完全清（git diff 零残留）。
+- **ext 包是安装副本机制**（2026-11-14）：改源仓后必须重跑 `tphp ext --add`（重新拷贝
+  +编译）；`--relink` 只重编安装副本旧代码。`ext --list` 的 built-in 标记是注册表
+  残留，exe 里未必有符号（grep 二进制验证）。并行会话的全量 build 会洗掉 teb 链接。
+- **引擎 bug #1（已修 2026-11-14）**：`tphp_vm_call_bounded` 异常逃逸分支不清
+  `vm->x.exception` → 残留指针让后续所有无 catch 回调恒 500（teb P0 冒烟 29 FAIL
+  的根因）；累积堆破坏至进程退出段错误。修复：escaped 分支置 NULL（异常对象挂
+  GC 表，sweep 回收）。修复后引擎全量 247 passed 0 failed。
+- **引擎 bug #2（未修，待拍板）**：main frame 的 method-call receiver/返回值 TMP
+  槽存在无引用幽灵拷贝（dump 实证：4 槽装 $web 仅 1 份引用），`frame_destroy` 全
+  槽释放时对已入池对象二次 free → **任何 teb 脚本自然退出必段错误**（EXIT=139）。
+  历史所有验证均以 kill/Ctrl+C 收尾故从未暴露。规避：测试脚本以 kill 收尾；
+  根修需动 vm.c op 层 receiver/返回值槽语义（涉及 A2 并行会话工作区，待拍板）。
+- **流式路由写法**：返回值被契约忽略，**不要声明 `: Response` 再 `return null`**
+  ——类型检查 TypeError 走异常路径（bug #1 修复前会污染后续请求）。文档已注明。
