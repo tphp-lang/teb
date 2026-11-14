@@ -1,6 +1,6 @@
 <?php
 // Tphp\Teb 对象 API 最小用例
-// 运行：tphp run tests/hello.php
+// 运行：tphp run example/hello.php
 // 然后浏览器访问 http://localhost:8080/hello 或 http://localhost:8080/
 
 use Tphp\Teb\Web;
@@ -8,6 +8,18 @@ use Tphp\Teb\Request;
 use Tphp\Teb\Response;
 
 $web = new Web();
+
+echo "Tphp\\Teb Web Server starting...\n";
+echo "Listening on port 8080\n";
+echo "Press Ctrl+C to stop\n";
+
+$web->start([
+    "document_root" => __DIR__,
+    "listening_ports" => "8080",
+    "num_threads" => "50",
+    "request_timeout_ms" => "30000",
+    "authentication_domain" => "mydomain.com",
+]);
 
 $web->route("/", fn(Request $r) => new Response("hello world\n"));
 
@@ -18,13 +30,5 @@ $web->route("/hello", function (Request $r): Response {
         ["Content-Type" => "text/plain; charset=utf-8"]
     );
 });
-
-$web->start([
-    "document_root" => __DIR__,
-    "listening_ports" => "8080",
-    "num_threads" => "50",
-    "request_timeout_ms" => "30000",
-    "authentication_domain" => "mydomain.com",
-]);
 
 $web->run();   // 阻塞常驻（Ctrl+C 停止，析构自动 stop）

@@ -1,0 +1,1 @@
+note.txt - 普通静态文件，Content-Type 由扩展名推断（text/plain）。
