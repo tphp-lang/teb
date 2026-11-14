@@ -994,9 +994,16 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     mg_set_request_handler(g_teb.ctx, "/*", teb_req_thunk, NULL);
 
     o->props[0] = TV_INT((int64_t)(uintptr_t)g_teb.ctx);
-    /* 登记运行中实例（real_stop 释放引用并清 props[0]） */
+    /* 登记运行中实例（real_stop 释放引用并清 props[0]）。
+     * 引擎 bug #2 根因（2026-11-14）：此处原 addref 一次两用（全局存储份
+     * + 返回值转移份）——g_teb.web_obj 是 bitcopy 不持有，real_stop 的
+     * release 实际吃掉 $web/返回值 dst 的合法份额 → main frame 返回值
+     * TMP 槽变幽灵 → 自然退出二次 free（EXIT=139/SIGSEGV）。修复 = 全局
+     * 份与返回值转移份各自独立 addref（引擎约定：native 返回值自带一
+     * 份转移，见引擎 doc/ext-dev.md 所有权节）。 */
     g_teb.web_obj = TV_OBJ(o);
-    tval_addref(TV_OBJ(o));
+    tval_addref(TV_OBJ(o));   /* g_teb 持有自己的份（real_stop 释放） */
+    tval_addref(TV_OBJ(o));   /* 返回值转移份（调用方 dst 接管） */
     return TV_OBJ(o);
 }
 

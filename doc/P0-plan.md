@@ -93,36 +93,25 @@
   `vm->x.exception` → 残留指针让后续所有无 catch 回调恒 500（teb P0 冒烟 29 FAIL
   的根因）；累积堆破坏至进程退出段错误。修复：escaped 分支置 NULL（异常对象挂
   GC 表，sweep 回收）。修复后引擎全量 247 passed 0 failed。
-- **引擎 bug #2（已实测复现，独立存在——2026-11-14 主窗口"证据不支持"结论经
-  复核不成立，见下）**：**任何 teb 脚本自然退出必段错误（EXIT=139）**。最小复现
-  （5 行，无需请求/异常/流式）：
+- **引擎 bug #2（已修复 2026-11-14，主窗口会话）**：**任何 teb 脚本自然退出必段
+  错误（EXIT=139）**——根因在 **teb 侧**而非引擎 op 层：`nm_web_start` 原实现
+  `g_teb.web_obj = TV_OBJ(o)`（bitcopy 不持有）+ **一次 addref 一次两用**
+  （g_teb 全局存储份 + 返回值转移份）→ real_stop 的 release 吃掉 main frame
+  返回值 TMP 槽的合法份额 → 帧尾二次 free（EXIT=139）。修复 = 全局份与返回值
+  转移份各自独立 addref（teb.c `nm_web_start` 尾部双 addref；所有权约定见引擎
+  doc/ext-dev.md）。
 
-  ```php
-  <?php
-  use Tphp\Teb\Web;
-  $web = new Web();
-  $web->start(["listening_ports" => "18152", "num_threads" => "2"]);
-  $web->stop();
-  echo "A-done\n";   // 打出后进程 SIGSEGV
-  ```
-  运行：`tphp run <该脚本>` → done 打出、EXIT=139。
-
-  证据链（bug #1 修复在位的引擎上，`plain-throw` 后回调全部正常证实修复生效）：
-  - 对照排除：纯 PHP 对象 self 链式（`$p->m()->m()->m()`）自然退出 EXIT=0；
-    teb 仅 `route()` 不 start/stop 自然退出 EXIT=0 → 触发面收敛到 `Web::start()`。
-  - 病灶隔离实验：`nm_web_start` 临时改为 `return TV_NULL`（不返回 self）→
-    同脚本 EXIT=0；恢复 `return TV_OBJ(o)`（+addref）→ EXIT=139。**病灶 =
-    native 方法返回 self 的所有权链**（op_do_fcall native 分支的返回值写槽 /
-    INIT_MCALL receiver addref-release 对账，方向明确、逐行归因待引擎侧）。
-  - gdb 实证：main frame dump（n_locals=1/n_tmps=8）中 `$web` 占 slot0（CV）与
-    slot1（start 返回值 dst）两槽，首次 tobj_free 时 rc=1（仅 CV 一份真引用）
-    → slot1 为无引用幽灵 → frame_destroy 逐槽释放时二次 free（slow 路径
-    obj_has_dtor 读池 freelist cls=nil 崩）。
-  - 用户侧规避无效：`$web = null` 只清 CV，slot1 幽灵仍在（实测 EXIT=139）。
-  - **规避保留：测试/长驻脚本以 kill 收尾**；根修需动 vm.c op 层返回值/receiver
-    槽语义（A2 工作区），候选试验点：op_do_fcall native 分支 `*d = r` 与
-    INIT_MCALL `rec->this_obj` addref/release 的对账。
-  - 注：引擎 247 项测试不覆盖"ext 原生类对象在 main frame 存活到自然退出"形态，
-    故引擎侧历史全绿与此 bug 并不矛盾。
+  定位过程证据链（留档）：
+  - bug #1 修复在位前提下最小复现仍 EXIT=139（5 行脚本：new→start→stop→退出，
+    已收编引擎回归 `tests/standard/test-native-self-return.php`，无 teb 时 skip）；
+  - 对照排除：纯 PHP 对象 self 链式 / teb 仅 route 均 EXIT=0（触发面收敛到 start）；
+  - 隔离实验：start 临时 `return TV_NULL` → EXIT=0（self 返回链实锤）；
+  - gdb：main frame `$web` 占 slot0（CV，真引用 rc=1）+ slot1（返回值 dst，幽灵）；
+  - `$web = null` 用户侧规避无效（幽灵在返回值 dst 槽非 CV）。
+  - 主窗口修复后：repro-139 EXIT=0、teb 冒烟 44/44 + 22/22（自然退出断言已解除
+    kill 收尾规避）、引擎回归用例过。
+  - 教训：gdb 槽 dump 的"rc 少 1"当时被归因为引擎 op 层对账错位——实际是
+    **ext 侧全局存储 TV_OBJ 未按"存储份+转移份"双 addref**；ext-dev.md 所有权
+    约定应作为 ext 开发首读项。
 - **流式路由写法**：返回值被契约忽略，**不要声明 `: Response` 再 `return null`**
   ——类型检查 TypeError 走异常路径（bug #1 修复前会污染后续请求）。文档已注明。
