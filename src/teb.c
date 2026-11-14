@@ -2,23 +2,25 @@
  * tphp/teb - C extension (object API)
  *
  * civetweb HTTP server 原生桥接，2025 master 源码随包静态链入。
- * 对外只暴露五个原生类（无顶层函数）：
+ * 对外只暴露七个原生类（无顶层函数）：
  *
- *   Tphp\Teb\Web          服务器生命周期：route()/notFound()/start()/run()/drain()/stop()
+ *   Tphp\Teb\Web          服务器生命周期：route()/notFound()/before()/file()/websocket()
+ *                         /start()/run()/drain()/stop()/stats()
  *   Tphp\Teb\Request      路由回调入参：method()/uri()/header()/body()/form()/file()...
- *   Tphp\Teb\Response     回调返回值：new Response(...) + 链式 + 静态工厂 json/text/html/redirect
+ *   Tphp\Teb\Response     回调返回值：new Response(...) + 链式 + 静态工厂 json/text/html/redirect/file
  *   Tphp\Teb\Stream       流式响应：beginStream() 产物，惰性发头、close 定界
  *   Tphp\Teb\UploadedFile 上传文件：form()/files() 产物，moveTo() 落盘
+ *   Tphp\Teb\WebSocket    WS 连接（P1）：websocket() 回调入参，send/ping/close/remoteAddr
  *
  * 线程模型（同步阻塞，2026-11-13 冒烟验证）：
- *   civetweb worker 进入 thunk → 入队 → 阻塞等 done；PHP 主线程 Web::run()
- *   内部 drain 循环取批 → 构造 Request → bounded 调用户回调 → 写 Response
- *   → 唤醒 worker。回调期间 conn 归本请求独占（worker 阻塞在 thunk 内）。
- *   stop 先置 shutdown + broadcast 防死锁，worker 醒来自行摘队列释放。
- *   无匹配路由 → notFound 命中入队；无 nf → 最长路由兜底；全无 → thunk
- *   返回 0，civetweb 默认处理（静态文件/404）。
- *   回调抛异常或未返回 Response → C 侧写 500，异常信息照常打印；
- *   已 beginStream 的请求返回值一律忽略（流式收尾契约见 P0-design §1）。
+ *   civetweb worker 进入 thunk/WS 回调 → 入队 → 阻塞等 done；PHP 主线程
+ *   Web::run() 内部 drain 循环取批 → 构造 Request → before 链 → 路由/静态/WS
+ *   分发 → 写响应 → 唤醒 worker。回调期间 conn 归本请求独占。
+ *   路由匹配：精确 → 前缀 → 静态文件（前缀+存在性，thunk 内判定）→ notFound
+ *   → 最长路由兜底 → return 0 交 civetweb 默认处理。
+ *   回调异常/非 Response → C 侧写 500（异常信息照常打印）；流式回调返回值
+ *   一律忽略（收尾契约见 P0-design §1）。
+ *   stats 计数全部在 PHP 主线程写（drain/回调），thunk/WS 回调线程不写 → 无锁。
  */
 #include "pkg.h"            /* tphp_ext_reg_const_str / tphp_ext_reg_fn / tphp_json_encode_c */
 #include "value.h"          /* TVal / TV_* / tstr_* / tm_* */
@@ -36,6 +38,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 /* 统一分配器：tm_malloc + memcpy。勿用 libc strdup —— stop 释放路由表走
  * tm_free，strdup 块与之混搭会 mi_free invalid pointer（2026-11-14 冒烟实测）。 */
@@ -59,21 +63,77 @@ typedef struct TebRoute {
     struct TebRoute *next;
 } TebRoute;
 
-typedef struct TebRequest {
+/* P1-3 静态文件目录映射（$web->file(prefix, dir)；多条，头插） */
+typedef struct TebStatic {
+    char *prefix;
+    char *dir;
+    struct TebStatic *next;
+} TebStatic;
+
+/* P1-4 WebSocket 注册（$web->websocket(uri, onOpen, onMsg, onClose)） */
+typedef struct TebWsReg {
+    char *uri;
+    TVal on_open;
+    TVal on_msg;      /* TV_NULL = 未提供 */
+    TVal on_close;    /* TV_NULL = 未提供 */
+    struct TebWsReg *next;
+} TebWsReg;
+
+/* P1-4 WS 连接登记（node 持 obj +1，生命周期 = 连接；mu 保护） */
+typedef struct TebWsSock {
+    TObj *obj;
     struct mg_connection *conn;
-    TebRoute *route;
+    struct TebWsSock *next;
+} TebWsSock;
+
+/* 队列节点 kind */
+enum {
+    TEQ_REQ = 0,      /* 路由/nf/兜底命中的 HTTP 请求 */
+    TEQ_STATIC = 1,   /* 静态文件命中 */
+    TEQ_WS_OPEN = 2,  /* WS 握手完成（ready） */
+    TEQ_WS_MSG = 3,   /* WS 数据帧 */
+    TEQ_WS_CLOSE = 4  /* WS 连接关闭 */
+};
+
+typedef struct TebRequest {
+    int kind;
+    struct mg_connection *conn;
+    TebRoute *route;            /* TEQ_REQ：命中路由（nf/兜底也走此） */
+    char *path;                 /* TEQ_STATIC：文件路径（thunk 分配，drain 释放） */
+    long long path_size;        /* TEQ_STATIC：文件大小（bytes_sent 近似用） */
+    TebWsReg *ws_reg;           /* TEQ_WS_*：所属注册 */
+    char *ws_data;              /* TEQ_WS_MSG：帧数据拷贝（civetweb 缓冲出回调即失效） */
+    size_t ws_data_len;
+    int ws_bits;                /* TEQ_WS_MSG：首字节 opcode */
     struct TebRequest *next;
-    bool done;              /* drain 已写完响应（唤醒等待的 worker） */
+    bool done;
 } TebRequest;
+
+/* P1-1 运行统计（PHP 主线程独占写：drain/回调；thunk/WS 回调线程不写 → 无锁） */
+typedef struct {
+    int64_t started_at;         /* start 时 time(NULL)；0 = 从未启动 */
+    int64_t requests_total;     /* drain 处理过的 HTTP 请求数（含 nf/静态） */
+    int64_t requests_active;    /* 本批正在处理中 */
+    int64_t bytes_sent;         /* teb_wr 累计（静态直通另加文件大小，近似） */
+    int64_t ws_active;
+    int64_t ws_frames;
+    int64_t ws_closed;
+    struct { int64_t code; int64_t n; } resp_tab[32];
+    int resp_n;
+} TebStats;
 
 typedef struct {
     bool inited;
     struct mg_context *ctx;
     TebRoute *routes;          /* 注册的路由列表（与 ctx 解耦） */
     TebRoute *nf;              /* notFound 回调（单条，stop 单独释放） */
+    TebRoute *befores;         /* P1-2 before 中间件链（按注册序 = 尾插） */
+    TebStatic *statics;        /* P1-3 静态目录映射（多条，头插） */
+    TebWsReg *ws_regs;         /* P1-4 WS 注册（头插；stop 释放） */
+    TebWsSock *ws_socks;       /* P1-4 WS 连接登记（mu 保护） */
     TebRequest *req_head;      /* 挂起请求队列头 */
     TebRequest *req_tail;
-    uv_mutex_t mu;             /* 保护队列 / done / shutdown */
+    uv_mutex_t mu;             /* 保护队列 / done / shutdown / ws_socks */
     uv_cond_t cv;              /* worker↔drain 双向唤醒 */
     bool mu_inited;
     bool shutdown;             /* stop 置位：唤醒全部等待中的 worker */
@@ -82,6 +142,7 @@ typedef struct {
     TVal web_obj;              /* 运行中 Web 对象（+1；real_stop 释放） */
     char upload_tmp_dir[400];  /* 上传 tmp 目录（start 自留键；缺省系统 tmp） */
     int64_t upload_max_bytes;  /* 上传/单字段累计上限（缺省 64M） */
+    TebStats st;               /* P1-1 运行统计 */
 } TebGlobal;
 
 static TebGlobal g_teb;
@@ -92,6 +153,7 @@ static _Thread_local TClass *g_req_cls;
 static _Thread_local TClass *g_resp_cls;
 static _Thread_local TClass *g_stream_cls;
 static _Thread_local TClass *g_upfile_cls;
+static _Thread_local TClass *g_ws_cls;
 
 /* 首次初始化必须发生在 Web::start（PHP 主线程、mg_start 创建 worker 之前） */
 static void teb_lock(void) {
@@ -107,6 +169,40 @@ static void teb_lock(void) {
 
 /* Request info 缓存读取（定义于 Request 方法区；此处前置） */
 static TVal teb_info_get(TObj *o, const char *key);
+
+/* P1-1 统一写出口：全部 PHP 侧响应写出走此（bytes_sent 累加）。
+ * 仅 PHP 主线程调用（drain/回调），thunk/WS 回调线程不写 → 无锁。 */
+static int teb_wr(struct mg_connection *conn, const void *buf, size_t len) {
+    int n = (int)mg_write(conn, buf, (unsigned long long)len);
+    if (n > 0) g_teb.st.bytes_sent += n;
+    return n;
+}
+
+/* P1-1 按实际写出状态码计数（resp_tab 线性表，溢出丢弃新码） */
+static void teb_stat_resp(int64_t code) {
+    if (code < 100 || code > 999) return;
+    for (int i = 0; i < g_teb.st.resp_n; i++) {
+        if (g_teb.st.resp_tab[i].code == code) {
+            g_teb.st.resp_tab[i].n++;
+            return;
+        }
+    }
+    if (g_teb.st.resp_n < 32) {
+        g_teb.st.resp_tab[g_teb.st.resp_n].code = code;
+        g_teb.st.resp_tab[g_teb.st.resp_n].n = 1;
+        g_teb.st.resp_n++;
+    }
+}
+
+/* ASCII 大小写不敏感整串比较 */
+static bool str_icmp(const char *a, const char *b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
 
 /* ASCII 大小写不敏感子串 */
 static bool str_icontains(const char *hay, const char *needle) {
@@ -245,26 +341,82 @@ static TebRoute *teb_match_route(const char *uri) {
     return r;
 }
 
-/* ---- civetweb request handler thunk（同步阻塞，见文件头） ---- */
-static int teb_req_thunk(struct mg_connection *conn, void *cbdata) {
-    (void)cbdata;
-    const struct mg_request_info *ri = mg_get_request_info(conn);
-    if (!ri || !ri->local_uri_raw) return 0;
+/* ---- P1-3 静态文件匹配（thunk 线程调用；纯字符串 + uv 同步 stat） ---- */
 
-    TebRoute *r = teb_match_route(ri->local_uri_raw);
-    if (!r) return 0;   /* 无路由 → civetweb 默认处理 */
+static bool teb_fs_stat(const char *path, bool *is_dir, long long *size) {
+    uv_fs_t r;
+    if (uv_fs_stat(NULL, &r, path, NULL) != 0) {
+        uv_fs_req_cleanup(&r);
+        return false;
+    }
+    *is_dir = S_ISDIR(r.statbuf.st_mode);
+    *size = (long long)r.statbuf.st_size;
+    uv_fs_req_cleanup(&r);
+    return true;
+}
 
-    TebRequest *req = tm_malloc(sizeof *req);
-    req->conn = conn;
-    req->route = r;      /* 只读指针，无并发写风险 */
-    req->done = false;
-    req->next = NULL;
+/* decoded uri 对 statics 链做前缀匹配；命中（文件/目录 index.html 存在）
+ * 返回 true 并经 out_path（tm_malloc，drain 释放）交出路径。rest 逐段
+ * 拒绝 ".."（防穿越）；条目按注册序，首个命中即用。 */
+static bool teb_static_match(const char *uri, char **out_path, long long *out_size) {
+    if (!uri) return false;
+    size_t lu = strlen(uri);
+    for (TebStatic *ts = g_teb.statics; ts; ts = ts->next) {
+        size_t lp = strlen(ts->prefix);
+        if (lu < lp || strncmp(uri, ts->prefix, lp) != 0) continue;
+        if (uri[lp] != 0 && uri[lp] != '/') continue;
+        const char *rest = uri + lp;
+        while (*rest == '/') rest++;
+        bool bad = false;
+        for (const char *p = rest; *p; ) {
+            const char *slash = strchr(p, '/');
+            size_t seg = slash ? (size_t)(slash - p) : strlen(p);
+            if (seg == 2 && p[0] == '.' && p[1] == '.') { bad = true; break; }
+            if (!slash) break;
+            p = slash + 1;
+        }
+        if (bad) continue;
 
+        size_t ld = strlen(ts->dir);
+        while (ld > 0 && ts->dir[ld - 1] == '/') ld--;
+        size_t cap = ld + strlen(rest) + 32;
+        char *cand = tm_malloc(cap);
+        snprintf(cand, cap, "%.*s/%s", (int)ld, ts->dir, rest);
+
+        bool is_dir = false;
+        long long sz = 0;
+        if (!teb_fs_stat(cand, &is_dir, &sz)) {
+            tm_free(cand);
+            continue;   /* 不存在 → 未命中（nf/兜底不被静态遮蔽） */
+        }
+        if (is_dir) {
+            snprintf(cand, cap, "%.*s/%s/index.html", (int)ld, ts->dir, rest);
+            if (!teb_fs_stat(cand, &is_dir, &sz) || is_dir) {
+                tm_free(cand);
+                continue;   /* 目录无 index.html → 未命中 */
+            }
+        }
+        *out_path = cand;
+        *out_size = sz;
+        return true;
+    }
+    return false;
+}
+
+/* ---- 队列入队 + 阻塞等待（thunk 与 WS 回调共用；worker 线程） ---- */
+
+static void teb_req_free(TebRequest *req) {
+    if (req->path) tm_free(req->path);
+    if (req->ws_data) tm_free(req->ws_data);
+    tm_free(req);
+}
+
+static bool teb_enqueue_and_wait(TebRequest *req) {
     teb_lock();
     if (g_teb.shutdown) {            /* stop 与新请求赛跑 */
         uv_mutex_unlock(&g_teb.mu);
-        tm_free(req);
-        return 0;
+        teb_req_free(req);
+        return false;
     }
     if (g_teb.req_tail) g_teb.req_tail->next = req;
     else g_teb.req_head = req;
@@ -287,8 +439,99 @@ static int teb_req_thunk(struct mg_connection *conn, void *cbdata) {
         }
     }
     uv_mutex_unlock(&g_teb.mu);
-    tm_free(req);   /* 分配者释放；done 后 drain 不再访问该节点 */
-    return ok ? 1 : 0;
+    teb_req_free(req);   /* 分配者释放；done 后 drain 不再访问该节点 */
+    return ok;
+}
+
+/* ---- civetweb request handler thunk（同步阻塞，见文件头） ---- */
+static int teb_req_thunk(struct mg_connection *conn, void *cbdata) {
+    (void)cbdata;
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+    if (!ri || !ri->local_uri_raw) return 0;
+
+    /* P1-4 WS 升级请求放行：交回 civetweb 走 websocket handler 握手。
+     * 我们的通配 request handler 优先级高于 WS handler，不识别 Upgrade
+     * 会把握手请求吞进路由（实测：/ws 落兜底路由回 pong，握手必败）。
+     * 普通 GET（无 Upgrade 头）仍走路由/nf。 */
+    for (int i = 0; i < ri->num_headers; i++) {
+        const struct mg_header *h = &ri->http_headers[i];
+        if (h->name && h->value && str_icmp(h->name, "Upgrade") &&
+            str_icontains(h->value, "websocket"))
+            return 0;
+    }
+
+    TebRequest *req = tm_malloc(sizeof *req);
+    memset(req, 0, sizeof *req);
+    req->conn = conn;
+
+    /* P1-3 静态文件优先于 nf/兜底（存在性判定在 thunk：不存在继续走
+     * 路由匹配，nf 不被静态遮蔽）；匹配/穿越检查用 decoded local_uri */
+    if (teb_static_match(ri->local_uri, &req->path, &req->path_size)) {
+        req->kind = TEQ_STATIC;
+    } else {
+        req->kind = TEQ_REQ;
+        req->route = teb_match_route(ri->local_uri_raw);
+        if (!req->route) {   /* 全无命中 → civetweb 默认处理 */
+            tm_free(req);
+            return 0;
+        }
+    }
+
+    return teb_enqueue_and_wait(req) ? 1 : 0;
+}
+
+/* ---- P1-4 WebSocket civetweb 回调（worker 线程：入队 + 阻塞） ---- */
+
+static int ws_connect_ok(const struct mg_connection *conn, void *cbdata) {
+    (void)conn; (void)cbdata;
+    return 0;   /* 放行（握手前拒绝留 P2） */
+}
+
+static void ws_ready_cb(struct mg_connection *conn, void *cbdata) {
+    TebRequest *req = tm_malloc(sizeof *req);
+    memset(req, 0, sizeof *req);
+    req->kind = TEQ_WS_OPEN;
+    req->conn = conn;
+    req->ws_reg = (TebWsReg *)cbdata;
+    teb_enqueue_and_wait(req);
+}
+
+static int ws_data_cb(struct mg_connection *conn, int bits, char *data,
+                      size_t len, void *cbdata) {
+    TebRequest *req = tm_malloc(sizeof *req);
+    memset(req, 0, sizeof *req);
+    req->kind = TEQ_WS_MSG;
+    req->conn = conn;
+    req->ws_reg = (TebWsReg *)cbdata;
+    req->ws_bits = bits;
+    if (data && len) {
+        req->ws_data = tm_malloc(len);   /* civetweb 缓冲出回调即失效：拷贝 */
+        memcpy(req->ws_data, data, len);
+        req->ws_data_len = len;
+    }
+    teb_enqueue_and_wait(req);
+
+    /* close_requested 判定（mu 内读登记链；node 持 obj 引用无 UAF；
+     * 同一连接的 data/close 回调由 civetweb 串行化，无并发读） */
+    bool closed = false;
+    teb_lock();
+    for (TebWsSock *n = g_teb.ws_socks; n; n = n->next) {
+        if (n->conn == conn && n->obj->props[1].t == T_TRUE) {
+            closed = true;
+            break;
+        }
+    }
+    uv_mutex_unlock(&g_teb.mu);
+    return closed ? 0 : 1;
+}
+
+static void ws_close_cb(const struct mg_connection *conn, void *cbdata) {
+    TebRequest *req = tm_malloc(sizeof *req);
+    memset(req, 0, sizeof *req);
+    req->kind = TEQ_WS_CLOSE;
+    req->conn = (struct mg_connection *)conn;   /* drain 内只读比较用 */
+    req->ws_reg = (TebWsReg *)cbdata;
+    teb_enqueue_and_wait(req);   /* conn 在 close 回调返回后才被 civetweb 释放 */
 }
 
 /* ---- 参数 helper ---- */
@@ -440,7 +683,7 @@ static void teb_emit_pairs(struct mg_connection *conn, TArr *a,
         int ln = snprintf(line, cap, "%s%.*s%s%.*s\r\n",
                           pre, (int)k->len, k->c, sep,
                           (int)vs->len, vs->c);
-        mg_write(conn, line, (unsigned long long)ln);
+        teb_wr(conn, line, (unsigned long long)ln);
         tm_free(line);
         tval_release(&tmp);
     }
@@ -455,7 +698,8 @@ static void teb_write_response(struct mg_connection *conn, TObj *r) {
     char line[160];
     int ln = snprintf(line, sizeof line, "HTTP/1.1 %lld %s\r\n",
                       (long long)status, reason ? reason : "OK");
-    mg_write(conn, line, (unsigned long long)ln);
+    teb_wr(conn, line, (unsigned long long)ln);
+    teb_stat_resp(status);
 
     if (r->props[2].t == T_ARR)
         teb_emit_pairs(conn, (TArr *)r->props[2].u.p, "", ": ");
@@ -465,8 +709,8 @@ static void teb_write_response(struct mg_connection *conn, TObj *r) {
     size_t blen = body ? body->len : 0;
     ln = snprintf(line, sizeof line,
                   "Content-Length: %zu\r\nConnection: close\r\n\r\n", blen);
-    mg_write(conn, line, (unsigned long long)ln);
-    if (body && blen) mg_write(conn, body->c, (unsigned long long)blen);
+    teb_wr(conn, line, (unsigned long long)ln);
+    if (body && blen) teb_wr(conn, body->c, (unsigned long long)blen);
 }
 
 /* 回调异常 / 未返回 Response 的兜底 */
@@ -476,7 +720,8 @@ static const char TEB_500[] =
     "Connection: close\r\n\r\nInternal Server Error";
 
 static void teb_write_500(struct mg_connection *conn) {
-    mg_write(conn, TEB_500, sizeof TEB_500 - 1);
+    teb_wr(conn, TEB_500, sizeof TEB_500 - 1);
+    teb_stat_resp(500);
 }
 
 /* ---- 流式响应（P0-design §1） ----
@@ -495,10 +740,11 @@ static void teb_stream_send_headers(TObj *s) {
     char line[160];
     int ln = snprintf(line, sizeof line, "HTTP/1.1 %lld %s\r\n",
                       (long long)status, reason ? reason : "OK");
-    mg_write(conn, line, (unsigned long long)ln);
+    teb_wr(conn, line, (unsigned long long)ln);
+    teb_stat_resp(status);
     if (s->props[2].t == T_ARR)
         teb_emit_pairs(conn, (TArr *)s->props[2].u.p, "", ": ");
-    mg_write(conn, "Connection: close\r\n\r\n", 21);
+    teb_wr(conn, "Connection: close\r\n\r\n", 21);
 }
 
 /* ---- body 缓存读取（P0-design §4：body()/json()/form() 共用 props[5]） ----
@@ -765,6 +1011,129 @@ static void teb_real_stop(void) {
         tm_free(g_teb.nf);
         g_teb.nf = NULL;
     }
+    /* P1-2 before 链 */
+    for (TebRoute *b = g_teb.befores; b; ) {
+        TebRoute *nx = b->next;
+        tval_release(&b->callable);
+        tm_free(b);
+        b = nx;
+    }
+    g_teb.befores = NULL;
+    /* P1-3 静态目录映射 */
+    for (TebStatic *ts = g_teb.statics; ts; ) {
+        TebStatic *nx = ts->next;
+        tm_free(ts->prefix);
+        tm_free(ts->dir);
+        tm_free(ts);
+        ts = nx;
+    }
+    g_teb.statics = NULL;
+    /* P1-4 WS：全部连接登记摘链（obj props[0] 置 0 → send/close 抛 Error）
+     * + 释放引用；ws_regs 注册释放。mg_stop 已 join，单线程免锁。 */
+    TebWsSock *pend = g_teb.ws_socks;
+    g_teb.ws_socks = NULL;
+    while (pend) {
+        TebWsSock *n = pend;
+        pend = n->next;
+        n->obj->props[0] = TV_NULL;
+        tval_release(&(TVal){ .u.p = n->obj, .t = T_OBJ });
+        tm_free(n);
+    }
+    for (TebWsReg *rg = g_teb.ws_regs; rg; ) {
+        TebWsReg *nx = rg->next;
+        if (rg->uri) tm_free(rg->uri);
+        tval_release(&rg->on_open);
+        tval_release(&rg->on_msg);
+        tval_release(&rg->on_close);
+        tm_free(rg);
+        rg = nx;
+    }
+    g_teb.ws_regs = NULL;
+}
+
+/* P1-4 摘除某连接的全部 WS 登记（mu 内摘链置 0，锁外释放引用） */
+static void teb_ws_close_conn(struct mg_connection *conn) {
+    TebWsSock *pend = NULL;
+    teb_lock();
+    TebWsSock **pp = &g_teb.ws_socks;
+    while (*pp) {
+        TebWsSock *n = *pp;
+        if (n->conn == conn) {
+            n->obj->props[0] = TV_NULL;   /* send/ping/close 此后抛 Error */
+            *pp = n->next;
+            n->next = pend;               /* 复用 next 域组待释放链 */
+            pend = n;
+        } else {
+            pp = &n->next;
+        }
+    }
+    uv_mutex_unlock(&g_teb.mu);
+    while (pend) {
+        TebWsSock *n = pend;
+        pend = n->next;
+        tval_release(&(TVal){ .u.p = n->obj, .t = T_OBJ });
+        tm_free(n);
+    }
+}
+
+/* P1-2 跑 before 链 + 分发（REQ/STATIC 共用）。返回 false = 用户回调抛异常
+ * （响应由外层按流式状态收尾）；true = 响应已写出或流式接管。 */
+static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
+                         TebRoute *route, const char *static_path,
+                         long long static_size) {
+    /* before 链（按注册序）；任一 before 内 beginStream → 后续 before 与
+     * 路由/静态全部跳过（外层流式收尾） */
+    for (TebRoute *b = g_teb.befores; b; b = b->next) {
+        if (req->props[4].t == T_OBJ) return true;
+        TVal argv = TV_OBJ(req);
+        tval_addref(argv);
+        TVal out = TV_NULL;
+        bool ok = tphp_vm_call_bounded(vm, b->callable, &argv, 1, &out);
+        tval_release(&argv);
+        if (!ok) return false;   /* before 异常：外层按流式状态收尾 */
+        if (out.t == T_OBJ && ((TObj *)out.u.p)->cls == g_resp_cls) {
+            teb_write_response(conn, (TObj *)out.u.p);   /* 短路 */
+            tval_release(&out);
+            return true;
+        }
+        if (out.t != T_NULL) {
+            tphp_warn("PHP Warning: Teb before callback must return null "
+                      "or a Tphp\\Teb\\Response instance\n");
+            tval_release(&out);
+            teb_write_500(conn);
+            return true;
+        }
+        tval_release(&out);
+    }
+    if (req->props[4].t == T_OBJ) return true;   /* before 内 beginStream */
+
+    if (route) {
+        TVal argv = TV_OBJ(req);
+        tval_addref(argv);
+        TVal out = TV_NULL;
+        bool ok = tphp_vm_call_bounded(vm, route->callable, &argv, 1, &out);
+        tval_release(&argv);
+        if (!ok) return false;   /* route 异常：外层按流式状态收尾 */
+        if (out.t == T_OBJ && ((TObj *)out.u.p)->cls == g_resp_cls) {
+            teb_write_response(conn, (TObj *)out.u.p);
+        } else if (req->props[4].t == T_OBJ) {
+            /* 流式接管：返回值一律忽略 */
+        } else {
+            tphp_warn("PHP Warning: Teb route callback must return "
+                      "a Tphp\\Teb\\Response instance\n");
+            teb_write_500(conn);
+        }
+        tval_release(&out);
+        return true;
+    }
+
+    if (static_path) {
+        mg_send_mime_file(conn, static_path, NULL);
+        teb_stat_resp(200);
+        g_teb.st.bytes_sent += static_size;   /* 近似：mg_send_mime_file 内部写出不走 teb_wr */
+        return true;
+    }
+    return true;
 }
 
 static void teb_drain_once(VM *vm) {
@@ -779,7 +1148,10 @@ static void teb_drain_once(VM *vm) {
 
     while (q) {
         TebRequest *next = q->next;
-        if (q->route) {
+
+        if (q->kind == TEQ_REQ || q->kind == TEQ_STATIC) {
+            g_teb.st.requests_total++;
+            g_teb.st.requests_active++;
             /* 构造回调入参 Request（不走 ctor；drain 持有其 rc）。
              * props: 0=conn 1=info 2=form_cache 3=files_cache 4=stream_obj
              *        5=body_cache 6=qp_cache 7=cookie_cache */
@@ -787,15 +1159,16 @@ static void teb_drain_once(VM *vm) {
             req->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
             req->props[1] = TV_ARR(teb_req_info_arr(q->conn));
             TVal argv = TV_OBJ(req);
-            TVal out = TV_NULL;
-            bool ok = tphp_vm_call_bounded(vm, q->route->callable, &argv,
-                                           1, &out);
+            bool ok = teb_dispatch(vm, req, q->conn,
+                                   q->kind == TEQ_REQ ? q->route : NULL,
+                                   q->kind == TEQ_STATIC ? q->path : NULL,
+                                   q->path_size);
 
-            TVal sv = req->props[4];   /* beginStream 过？ */
+            TVal sv = req->props[4];   /* beginStream 过（before 或 route）？ */
             TObj *stream = (sv.t == T_OBJ && ((TObj *)sv.u.p)->cls == g_stream_cls)
                 ? (TObj *)sv.u.p : NULL;
             if (stream) {
-                /* 流式契约：返回值一律忽略（含 Response）；未 end 自动收尾；
+                /* 流式契约：返回值一律忽略；未 end 自动收尾；
                  * 异常时头已发仅置 ended 不写 500，头未发写 500 并锁死 Stream */
                 if (!ok) {
                     if (stream->props[3].t == T_TRUE) {
@@ -809,19 +1182,84 @@ static void teb_drain_once(VM *vm) {
                     teb_stream_send_headers(stream);   /* 未发头 → 空体响应头 */
                     stream->props[4] = TV_TRUE;
                 }
-            } else if (ok && out.t == T_OBJ &&
-                       ((TObj *)out.u.p)->cls == g_resp_cls) {
-                teb_write_response(q->conn, (TObj *)out.u.p);
-            } else {
-                if (ok)
-                    tphp_warn("PHP Warning: Teb route callback must return "
-                              "a Tphp\\Teb\\Response instance\n");
-                teb_write_500(q->conn);
+            } else if (!ok) {
+                teb_write_500(q->conn);   /* 非 流式 + 回调异常 */
             }
-            tval_release(&out);
             teb_reclaim_tmp(req);   /* 未 moveTo 的上传 tmp 回收 */
             tval_release(&argv);   /* Request 对象（回调捕获则继续存活） */
+            g_teb.st.requests_active--;
+        } else if (q->kind == TEQ_WS_OPEN) {
+            g_teb.st.ws_active++;
+            TebWsReg *reg = q->ws_reg;
+            TObj *s = tphp_obj_alloc(g_ws_cls);
+            s->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
+            s->props[1] = TV_FALSE;
+            teb_lock();
+            TebWsSock *node = tm_malloc(sizeof *node);
+            node->obj = s;
+            node->conn = q->conn;
+            node->next = g_teb.ws_socks;
+            g_teb.ws_socks = node;
+            uv_mutex_unlock(&g_teb.mu);
+            tval_addref(TV_OBJ(s));   /* node 持有份（生命周期 = 连接） */
+            /* on_open(WebSocket $s, Request $r)——返回值忽略；异常打印忽略 */
+            TObj *rq = tphp_obj_alloc(g_req_cls);
+            rq->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
+            rq->props[1] = TV_ARR(teb_req_info_arr(q->conn));
+            TVal args2[2] = { TV_OBJ(s), TV_OBJ(rq) };
+            TVal out = TV_NULL;
+            if (!tphp_vm_call_bounded(vm, reg->on_open, args2, 2, &out))
+                tphp_warn("PHP Warning: Teb WS onOpen callback raised (ignored)\n");
+            tval_release(&out);
+            tval_release(&args2[0]);   /* node 持份保留 */
+            tval_release(&args2[1]);   /* Request 引用尽（drain 持份） */
+        } else if (q->kind == TEQ_WS_MSG) {
+            g_teb.st.ws_frames++;
+            TebWsReg *reg = q->ws_reg;
+            TObj *s = tphp_obj_alloc(g_ws_cls);
+            s->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
+            s->props[1] = TV_FALSE;
+            teb_lock();
+            TebWsSock *node = tm_malloc(sizeof *node);
+            node->obj = s;
+            node->conn = q->conn;
+            node->next = g_teb.ws_socks;
+            g_teb.ws_socks = node;
+            uv_mutex_unlock(&g_teb.mu);
+            tval_addref(TV_OBJ(s));   /* node 持有份 */
+            if (reg->on_msg.t != T_NULL) {
+                TStr *ds = tstr_new(q->ws_data ? q->ws_data : "", q->ws_data_len);
+                TVal args2[3] = { TV_OBJ(s), TV_STR(ds), TV_INT(q->ws_bits) };
+                TVal out = TV_NULL;
+                if (!tphp_vm_call_bounded(vm, reg->on_msg, args2, 3, &out)) {
+                    tphp_warn("PHP Warning: Teb WS onMessage callback raised "
+                              "(closing connection)\n");
+                    s->props[1] = TV_TRUE;   /* close_requested → data 回调返回 0 */
+                }
+                tval_release(&out);
+                tval_release(&args2[0]);   /* node 持份保留 */
+                tval_release(&args2[1]);   /* 帧数据串（drain 持份） */
+                /* args2[2] int 无引用 */
+            }
+        } else if (q->kind == TEQ_WS_CLOSE) {
+            g_teb.st.ws_active--;
+            g_teb.st.ws_closed++;
+            teb_ws_close_conn(q->conn);   /* 全部登记摘链 + props[0] 置 0 */
+            TebWsReg *reg = q->ws_reg;
+            if (reg->on_close.t != T_NULL) {
+                /* on_close(WebSocket $s)——conn 在 close 回调阻塞期间仍有效 */
+                TObj *s = tphp_obj_alloc(g_ws_cls);
+                s->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
+                s->props[1] = TV_TRUE;
+                TVal args2[1] = { TV_OBJ(s) };
+                TVal out = TV_NULL;
+                if (!tphp_vm_call_bounded(vm, reg->on_close, args2, 1, &out))
+                    tphp_warn("PHP Warning: Teb WS onClose callback raised (ignored)\n");
+                tval_release(&out);
+                tval_release(&args2[1]);   /* drain 持份（一次性对象） */
+            }
         }
+
         teb_lock();
         q->done = true;
         uv_cond_broadcast(&g_teb.cv);   /* 唤醒该请求的 worker */
@@ -914,6 +1352,10 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     g_teb.pending_stop = false;
     uv_mutex_unlock(&g_teb.mu);
 
+    /* P1-1 stats 复位（started_at = 本次启动时刻） */
+    memset(&g_teb.st, 0, sizeof g_teb.st);
+    g_teb.st.started_at = (int64_t)time(NULL);
+
     /* 上传自留键缺省（P0-design §2：upload_tmp_dir / upload_max_bytes） */
     if (g_teb.upload_tmp_dir[0] == 0) {
         char t[380];
@@ -993,6 +1435,12 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     /* 统一 thunk 挂所有 URI：命中路由/nf 入队阻塞，全无命中交 civetweb 默认 */
     mg_set_request_handler(g_teb.ctx, "/*", teb_req_thunk, NULL);
 
+    /* P1-4 批量挂 WS handler（运行中 websocket() 注册者已即时挂） */
+    for (TebWsReg *rg = g_teb.ws_regs; rg; rg = rg->next) {
+        mg_set_websocket_handler(g_teb.ctx, rg->uri, ws_connect_ok,
+                                 ws_ready_cb, ws_data_cb, ws_close_cb, rg);
+    }
+
     o->props[0] = TV_INT((int64_t)(uintptr_t)g_teb.ctx);
     /* 登记运行中实例（real_stop 释放引用并清 props[0]）。
      * 引擎 bug #2 根因（2026-11-14）：此处原 addref 一次两用（全局存储份
@@ -1038,6 +1486,133 @@ static TVal nm_web_stop(VM *vm, void *self, TVal *args, int n) {
                       "running server");
     teb_real_stop();
     return TV_NULL;
+}
+
+/* P1-2 before(callable $cb): self —— 全局中间件（按注册序执行；单条可重复注册） */
+static TVal nm_web_before(VM *vm, void *self, TVal *args, int n) {
+    (void)self;
+    if (n < 1)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Web::before() expects a callable");
+    TVal cb = args[0];
+    switch (cb.t) {
+    case T_CLOSURE: case T_OBJ: case T_ARR: case T_STR: break;
+    default:
+        tphp_vm_raise(vm, "TypeError",
+                      "Web::before(): callable expected as argument 1");
+    }
+    TebRoute *b = tm_malloc(sizeof *b);
+    b->uri = NULL;
+    b->callable = cb;
+    tval_addref(cb);
+    b->next = NULL;
+    /* 尾插：按注册序执行 */
+    if (!g_teb.befores) {
+        g_teb.befores = b;
+    } else {
+        TebRoute *t = g_teb.befores;
+        while (t->next) t = t->next;
+        t->next = b;
+    }
+    tval_addref(TV_OBJ((TObj *)self));
+    return TV_OBJ((TObj *)self);
+}
+
+/* P1-1 stats(): array —— 运行统计；任意时刻可调（未启动全 0） */
+static TVal nm_web_stats(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)self; (void)args; (void)n;
+    TArr *a = tarr_new();
+    TebStats *st = &g_teb.st;
+    int64_t now = (int64_t)time(NULL);
+    struct KV { const char *k; int64_t v; };
+    struct KV kvs[] = {
+        { "started_at", st->started_at },
+        { "uptime", st->started_at ? now - st->started_at : 0 },
+        { "requests_total", st->requests_total },
+        { "requests_active", st->requests_active },
+        { "bytes_sent", st->bytes_sent },
+        { "ws_active", st->ws_active },
+        { "ws_frames", st->ws_frames },
+        { "ws_closed", st->ws_closed },
+    };
+    for (size_t i = 0; i < sizeof kvs / sizeof kvs[0]; i++) {
+        TVal k = TV_STR(tstr_intern(kvs[i].k, strlen(kvs[i].k)));
+        TVal v = TV_INT(kvs[i].v);
+        tarr_set(a, k, v);
+    }
+    /* responses 子数组（按实际写出状态码；键 = 十进制码字符串） */
+    TArr *rs = tarr_new();
+    for (int i = 0; i < st->resp_n; i++) {
+        char code[8];
+        snprintf(code, sizeof code, "%lld", (long long)st->resp_tab[i].code);
+        TVal k2 = TV_STR(tstr_intern(code, strlen(code)));
+        TVal v2 = TV_INT(st->resp_tab[i].n);
+        tarr_set(rs, k2, v2);
+    }
+    TVal rk = TV_STR(tstr_intern("responses", 9));
+    TVal rv = TV_ARR(rs);   /* rs rc=1 转移 */
+    tarr_set(a, rk, rv);
+    return TV_ARR(a);       /* a rc=1 转移 */
+}
+
+/* P1-3 file(string $uriPrefix, string $dir): self —— 静态目录映射（多条） */
+static TVal nm_web_file(VM *vm, void *self, TVal *args, int n) {
+    (void)self;
+    const char *prefix = arg_str(vm, args, n, 0, "Web::file");
+    const char *dir = arg_str(vm, args, n, 1, "Web::file");
+    if (n < 2)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Web::file() expects (string $uriPrefix, string $dir)");
+    TebStatic *ts = tm_malloc(sizeof *ts);
+    ts->prefix = teb_dup(prefix);
+    ts->dir = teb_dup(dir);
+    ts->next = g_teb.statics;   /* 头插：thunk 只读指针，注册即挂 */
+    g_teb.statics = ts;
+    tval_addref(TV_OBJ((TObj *)self));
+    return TV_OBJ((TObj *)self);
+}
+
+/* P1-4 websocket(string $uri, callable $onOpen, ?callable $onMessage = null,
+ *               ?callable $onClose = null): self */
+static TVal nm_web_websocket(VM *vm, void *self, TVal *args, int n) {
+    (void)self;
+    if (n < 2)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Web::websocket() expects (string $uri, callable $onOpen"
+                      ", ?callable $onMessage = null, ?callable $onClose = null)");
+    const char *uri = arg_str(vm, args, n, 0, "Web::websocket");
+    switch (args[1].t) {
+    case T_CLOSURE: case T_OBJ: case T_ARR: case T_STR: break;
+    default:
+        tphp_vm_raise(vm, "TypeError",
+                      "Web::websocket(): onOpen must be a callable");
+    }
+    for (int i = 2; i < n; i++) {
+        if (args[i].t == T_NULL) continue;
+        switch (args[i].t) {
+        case T_CLOSURE: case T_OBJ: case T_ARR: case T_STR: break;
+        default:
+            tphp_vm_raise(vm, "TypeError",
+                          "Web::websocket(): callbacks must be callable or null");
+        }
+    }
+    TebWsReg *rg = tm_malloc(sizeof *rg);
+    rg->uri = teb_dup(uri);
+    rg->on_open = args[1];
+    tval_addref(rg->on_open);
+    rg->on_msg = (n >= 3 && args[2].t != T_NULL) ? args[2] : TV_NULL;
+    if (rg->on_msg.t != T_NULL) tval_addref(rg->on_msg);
+    rg->on_close = (n >= 4 && args[3].t != T_NULL) ? args[3] : TV_NULL;
+    if (rg->on_close.t != T_NULL) tval_addref(rg->on_close);
+    rg->next = g_teb.ws_regs;
+    g_teb.ws_regs = rg;
+    /* 运行中注册：立即挂（start 前注册者由 start 批量挂） */
+    if (g_teb.ctx) {
+        mg_set_websocket_handler(g_teb.ctx, rg->uri, ws_connect_ok,
+                                 ws_ready_cb, ws_data_cb, ws_close_cb, rg);
+    }
+    tval_addref(TV_OBJ((TObj *)self));
+    return TV_OBJ((TObj *)self);
 }
 
 /* ---- Tphp\Teb\Request 原生方法（信息读 props[1] 缓存） ---- */
@@ -1600,6 +2175,86 @@ static TVal nm_resp_redirect(VM *vm, void *self, TVal *args, int n) {
     return TV_OBJ(r);
 }
 
+/* P1-3 同步读整个文件（uv_fs；UTF-8 路径安全）。
+ * 返回 0 成功（out/outlen 归调用方 tm_free）；1 不存在/不可读；2 超上限。 */
+static int teb_read_file(const char *path, char **out, size_t *outlen) {
+    uv_fs_t r;
+    if (uv_fs_open(NULL, &r, path, UV_FS_O_RDONLY, 0, NULL) < 0) {
+        uv_fs_req_cleanup(&r);
+        return 1;
+    }
+    uv_file fd = (uv_file)r.result;
+    uv_fs_req_cleanup(&r);
+    if (uv_fs_fstat(NULL, &r, fd, NULL) < 0) {
+        uv_fs_req_cleanup(&r);
+        uv_fs_close(NULL, &r, fd, NULL);
+        uv_fs_req_cleanup(&r);
+        return 1;
+    }
+    int64_t sz = (int64_t)r.statbuf.st_size;
+    uv_fs_req_cleanup(&r);
+    if (sz > g_teb.upload_max_bytes) {
+        uv_fs_close(NULL, &r, fd, NULL);
+        uv_fs_req_cleanup(&r);
+        return 2;
+    }
+    char *buf = tm_malloc((size_t)sz + 1);
+    int64_t off = 0;
+    while (off < sz) {
+        uv_buf_t iov = uv_buf_init(buf + off, (unsigned)(sz - off));
+        int64_t nread = uv_fs_read(NULL, &r, fd, &iov, 1, off, NULL);
+        if (nread < 0) {
+            uv_fs_req_cleanup(&r);
+            uv_fs_close(NULL, &r, fd, NULL);
+            uv_fs_req_cleanup(&r);
+            tm_free(buf);
+            return 1;
+        }
+        uv_fs_req_cleanup(&r);
+        if (nread == 0) break;   /* EOF（文件被并发截断等） */
+        off += nread;
+    }
+    uv_fs_close(NULL, &r, fd, NULL);
+    uv_fs_req_cleanup(&r);
+    buf[sz] = 0;
+    *out = buf;
+    *outlen = (size_t)sz;
+    return 0;
+}
+
+/* Response::file(string $path, int $status = 200, array $headers = []): Response
+ * 读整个文件入 body（超 upload_max_bytes / 不存在 / 不可读 → Error）；
+ * Content-Type 按扩展名推断（用户 headers 可覆盖） */
+static TVal nm_resp_file(VM *vm, void *self, TVal *args, int n) {
+    (void)self;
+    const char *path = arg_str(vm, args, n, 0, "Response::file");
+    char *pathcopy = teb_dup(path);
+    int64_t status = (n >= 2) ? tval_to_int(args[1]) : 200;
+    TArr *h = NULL;
+    if (!resp_headers_arg(args, n, 2, &h)) {
+        tm_free(pathcopy);
+        tphp_vm_raise(vm, "TypeError", "Response::file() expects an array of headers");
+    }
+    char *data = NULL;
+    size_t dlen = 0;
+    int rc = teb_read_file(pathcopy, &data, &dlen);
+    if (rc == 2) {
+        tm_free(pathcopy);
+        tphp_vm_raise(vm, "Error",
+                      "Response::file(): file exceeds upload_max_bytes");
+    }
+    if (rc != 0) {
+        tm_free(pathcopy);
+        tphp_vm_raise(vm, "Error", "Response::file(): cannot read file");
+    }
+    const char *mime = mg_get_builtin_mime_type(pathcopy);
+    TObj *r = teb_resp_build(tstr_new(data, dlen), status, h,
+                             mime ? mime : "application/octet-stream", NULL);
+    tm_free(data);
+    tm_free(pathcopy);
+    return TV_OBJ(r);
+}
+
 /* ---- Tphp\Teb\Stream 原生方法（P0-design §1）----
  * props: 0=conn 1=status 2=headers 3=header_sent 4=ended */
 
@@ -1649,7 +2304,7 @@ static TVal nm_stream_write(VM *vm, void *self, TVal *args, int n) {
     if (!conn)
         tphp_vm_raise(vm, "Error", "Tphp\\Teb\\Stream::write(): connection unavailable");
     teb_stream_send_headers(o);
-    int w = (int)mg_write(conn, cs->c, (unsigned long long)cs->len);
+    int w = (int)teb_wr(conn, cs->c, (unsigned long long)cs->len);
     return TV_INT(w);
 }
 
@@ -1665,7 +2320,7 @@ static TVal nm_stream_end(VM *vm, void *self, TVal *args, int n) {
         if (n >= 1 && args[0].t == T_STR) {
             TStr *last = (TStr *)args[0].u.p;
             if (last->len)
-                mg_write(conn, last->c, (unsigned long long)last->len);
+                teb_wr(conn, last->c, (unsigned long long)last->len);
         }
     }
     o->props[4] = TV_TRUE;
@@ -1752,6 +2407,81 @@ static TVal nm_upfile_move_to(VM *vm, void *self, TVal *args, int n) {
     return ok ? TV_TRUE : TV_FALSE;
 }
 
+/* ---- Tphp\Teb\WebSocket 原生方法（P1-4）----
+ * props: 0=conn 句柄（TV_NULL = 连接已关） 1=close_requested */
+
+static TVal nm_ws_construct(VM *vm, void *self, TVal *args, int n) {
+    (void)self; (void)args; (void)n;
+    tphp_vm_raise(vm, "Error",
+                  "Tphp\\Teb\\WebSocket cannot be constructed directly "
+                  "(instances are provided to websocket() callbacks)");
+}
+
+/* 活动连接句柄（props[0]==0 → 抛 Error("connection closed")） */
+static struct mg_connection *teb_ws_conn(TObj *o, VM *vm, const char *who) {
+    if (o->props[0].t != T_INT)
+        tphp_vm_raise(vm, "Error",
+                      "Tphp\\Teb\\WebSocket::%s(): connection closed", who);
+    return (struct mg_connection *)(uintptr_t)o->props[0].u.i;
+}
+
+/* send(string $data, bool $binary = false): int —— mg_lock_connection 包住
+ * 写出（防 civetweb 侧并发写），返回字节数 */
+static TVal nm_ws_send(VM *vm, void *self, TVal *args, int n) {
+    TObj *o = (TObj *)self;
+    struct mg_connection *conn = teb_ws_conn(o, vm, "send");
+    if (n < 1 || args[0].t != T_STR)
+        tphp_vm_raise(vm, "TypeError", "WebSocket::send() expects a string");
+    TStr *cs = (TStr *)args[0].u.p;
+    bool binary = (n >= 2 && tval_to_bool(args[1]));
+    int opcode = binary ? MG_WEBSOCKET_OPCODE_BINARY : MG_WEBSOCKET_OPCODE_TEXT;
+    mg_lock_connection(conn);
+    int w = mg_websocket_write(conn, opcode, cs->c, cs->len);
+    mg_unlock_connection(conn);
+    if (w < 0)
+        tphp_vm_raise(vm, "Error", "Tphp\\Teb\\WebSocket::send(): write failed");
+    return TV_INT(w);
+}
+
+/* ping(string $data = ""): bool */
+static TVal nm_ws_ping(VM *vm, void *self, TVal *args, int n) {
+    TObj *o = (TObj *)self;
+    struct mg_connection *conn = teb_ws_conn(o, vm, "ping");
+    TStr *cs = (n >= 1 && args[0].t == T_STR)
+        ? (TStr *)args[0].u.p : NULL;
+    mg_lock_connection(conn);
+    int w = mg_websocket_write(conn, MG_WEBSOCKET_OPCODE_PING,
+                               cs ? cs->c : "", cs ? cs->len : 0);
+    mg_unlock_connection(conn);
+    return w >= 0 ? TV_TRUE : TV_FALSE;
+}
+
+/* close(string $data = ""): void —— 发 close 帧 + 置 close_requested
+ * （本帧回调后 data 回调返回 0 断开）；幂等 */
+static TVal nm_ws_close(VM *vm, void *self, TVal *args, int n) {
+    (void)vm;
+    TObj *o = (TObj *)self;
+    if (o->props[0].t != T_INT) return TV_NULL;   /* 已关：幂等 */
+    struct mg_connection *conn = (struct mg_connection *)(uintptr_t)o->props[0].u.i;
+    TStr *cs = (n >= 1 && args[0].t == T_STR) ? (TStr *)args[0].u.p : NULL;
+    mg_lock_connection(conn);
+    mg_websocket_write(conn, MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE,
+                       cs ? cs->c : "", cs ? cs->len : 0);
+    mg_unlock_connection(conn);
+    o->props[1] = TV_TRUE;   /* close_requested → data 回调返回 0 */
+    return TV_NULL;
+}
+
+/* remoteAddr(): string —— 连接已关 → Error */
+static TVal nm_ws_remote_addr(VM *vm, void *self, TVal *args, int n) {
+    (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    struct mg_connection *conn = teb_ws_conn(o, vm, "remoteAddr");
+    const struct mg_request_info *ri = mg_get_request_info(conn);
+    const char *addr = (ri && ri->remote_addr[0]) ? ri->remote_addr : "";
+    return TV_STR(tstr_new(addr, strlen(addr)));
+}
+
 /* ---- 类注册（init 阶段，首脚本编译前） ---- */
 
 static void teb_register_classes(void) {
@@ -1760,6 +2490,10 @@ static void teb_register_classes(void) {
     teb_cls_add_prop(w, "ctx");
     teb_cls_add_native(w, "route", (void *)nm_web_route, false);
     teb_cls_add_native(w, "notFound", (void *)nm_web_not_found, false);
+    teb_cls_add_native(w, "before", (void *)nm_web_before, false);
+    teb_cls_add_native(w, "file", (void *)nm_web_file, false);
+    teb_cls_add_native(w, "websocket", (void *)nm_web_websocket, false);
+    teb_cls_add_native(w, "stats", (void *)nm_web_stats, false);
     teb_cls_add_native(w, "start", (void *)nm_web_start, false);
     teb_cls_add_native(w, "drain", (void *)nm_web_drain, false);
     teb_cls_add_native(w, "run", (void *)nm_web_run, false);
@@ -1822,6 +2556,7 @@ static void teb_register_classes(void) {
     teb_cls_add_native(rp, "text", (void *)nm_resp_text, true);
     teb_cls_add_native(rp, "html", (void *)nm_resp_html, true);
     teb_cls_add_native(rp, "redirect", (void *)nm_resp_redirect, true);
+    teb_cls_add_native(rp, "file", (void *)nm_resp_file, true);
     tphp_class_register_compile(rp);
     g_resp_cls = rp;
 
@@ -1858,6 +2593,18 @@ static void teb_register_classes(void) {
     teb_cls_add_native(uf, "moveTo", (void *)nm_upfile_move_to, false);
     tphp_class_register_compile(uf);
     g_upfile_cls = uf;
+
+    /* WebSocket：props 0=conn（TV_NULL=已关） 1=close_requested */
+    TClass *ws = teb_cls_new("Tphp\\Teb\\WebSocket");
+    teb_cls_add_prop(ws, "conn");
+    teb_cls_add_prop(ws, "close_requested");
+    teb_cls_add_ctor(ws, (void *)nm_ws_construct);
+    teb_cls_add_native(ws, "send", (void *)nm_ws_send, false);
+    teb_cls_add_native(ws, "ping", (void *)nm_ws_ping, false);
+    teb_cls_add_native(ws, "close", (void *)nm_ws_close, false);
+    teb_cls_add_native(ws, "remoteAddr", (void *)nm_ws_remote_addr, false);
+    tphp_class_register_compile(ws);
+    g_ws_cls = ws;
 }
 
 /* ---- init：被 ext registry 调用，首脚本编译前一次 ---- */

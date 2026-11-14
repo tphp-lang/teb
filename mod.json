@@ -4,8 +4,13 @@
   "type": "ext",
   "license": "MIT",
   "ext": {
-    "sources": ["src", "civetweb"],
-    "include": ["."],
+    "sources": [
+      "src",
+      "civetweb"
+    ],
+    "include": [
+      "."
+    ],
     "init": "tphp_ext_tphp_teb_init",
     "defines": [
       "OPENSSL_API_3_0",
@@ -13,21 +18,33 @@
       "USE_IPV6",
       "USE_SERVER_STATS"
     ],
-    "cflags": ["-w"],
+    "cflags": [
+      "-w"
+    ],
     "os": {
       "windows": {
         "cflags": [],
-        "libs": ["-lwinpthread"],
+        "libs": [
+          "-lwinpthread"
+        ],
         "ldflags": []
       },
       "linux": {
-        "cflags": ["-DUSE_ZLIB"],
-        "libs": ["-lz"],
+        "cflags": [
+          "-DUSE_ZLIB"
+        ],
+        "libs": [
+          "-lz"
+        ],
         "ldflags": []
       },
       "darwin": {
-        "cflags": ["-DUSE_ZLIB"],
-        "libs": ["-lz"],
+        "cflags": [
+          "-DUSE_ZLIB"
+        ],
+        "libs": [
+          "-lz"
+        ],
         "ldflags": []
       }
     },

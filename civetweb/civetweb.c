@@ -13388,10 +13388,11 @@ mg_unlock_context(struct mg_context *ctx)
 #if defined(USE_WEBSOCKET)
 
 #if !defined(NO_SSL_DL)
-#if !defined(OPENSSL_API_3_0)
+/* teb patch（2026-11-14）：OPENSSL_API_3_0 下也内置 sha1——WS 握手 sha1
+ * 与 SSL 后端解耦（原 3_0 分支走 EVP_get_digestbyname，teb 的 ssl: 端口
+ * 未启用时不加载 libssl → digest NULL → 空指针调用，实测 SIGSEGV）。 */
 #define SHA_API static
 #include "sha1.inl"
-#endif
 #endif
 
 static int
@@ -13400,9 +13401,7 @@ send_websocket_handshake(struct mg_connection *conn, const char *websock_key)
 	static const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 	char buf[100], sha[20], b64_sha[sizeof(sha) * 2];
 	size_t dst_len = sizeof(b64_sha);
-#if !defined(OPENSSL_API_3_0)
-	SHA_CTX sha_ctx;
-#endif
+	SHA_CTX sha_ctx;   /* teb patch：无条件声明（WS 握手统一走内置 sha1） */
 	int truncated;
 
 	/* Calculate Sec-WebSocket-Accept reply from Sec-WebSocket-Key. */
@@ -13414,18 +13413,10 @@ send_websocket_handshake(struct mg_connection *conn, const char *websock_key)
 
 	DEBUG_TRACE("%s", "Send websocket handshake");
 
-#if defined(OPENSSL_API_3_0)
-	EVP_Digest((unsigned char *)buf,
-	           (uint32_t)strlen(buf),
-	           (unsigned char *)sha,
-	           NULL,
-	           EVP_get_digestbyname("sha1"),
-	           NULL);
-#else
+	/* teb patch（2026-11-14）：统一走内置 sha1（见上方 include 处说明） */
 	SHA1_Init(&sha_ctx);
 	SHA1_Update(&sha_ctx, (unsigned char *)buf, (uint32_t)strlen(buf));
 	SHA1_Final((unsigned char *)sha, &sha_ctx);
-#endif
 	mg_base64_encode((unsigned char *)sha, sizeof(sha), b64_sha, &dst_len);
 	mg_printf(conn,
 	          "HTTP/1.1 101 Switching Protocols\r\n"
