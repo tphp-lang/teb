@@ -89,21 +89,27 @@ if wait_ready "$BASE/ping" 15; then
     curlp "$BASE/st-200" > /dev/null
     curlp "$BASE/st-201" > /dev/null
 
-    # ---------- WebSocket（握手 + onOpen + 回显 + 主动 close） ----------
-    wsout=$(WS_PORT=18165 WS_PATH="ws" WS_MSG="hello-ws" "$TPHP_BIN" run tests/wsclient.php 2>&1)
+    # ---------- WebSocket（握手 + onOpen + 回显 + PING/PONG + 分片 + 服务端 close） ----------
+    wsout=$(WS_PORT=18165 WS_PATH="ws" WS_MSG="hello-ws" WS_PING=1 WS_FRAG=1 "$TPHP_BIN" run tests/wsclient.php 2>&1)
     check "ws handshake 101" "1" "$(echo "$wsout" | grep -c 'HANDSHAKE=101')"
     check "ws accept header (RFC6455 sample)" "1" \
         "$(echo "$wsout" | grep -c 'ACCEPT=1')"
     check "ws onOpen hello (remoteAddr)" "1" \
         "$(echo "$wsout" | grep -c 'RECV=hello:127.0.0.1')"
-    # 帧层遗留（teb 包内已知问题）：civetweb data 回调给原始掩码帧，onMessage
-    # 的 $data 未解 mask → 回显断言暂挂；握手/onOpen/onClose 链路已验证
-    RESULTS+="SKIP  ws onMessage echo（帧 mask 解析待修，见 P1-design 教训节）"$'\n' 
+    check "ws onMessage echo + bits opcode(text=1)" "1" \
+        "$(echo "$wsout" | grep -c 'RECV2=echo:hello-ws b=1')"
+    check "ws ping auto-pong (op=10 payload pp)" "1" \
+        "$(echo "$wsout" | grep -c 'PONG_OP=10 PONG_DATA=pp')"
+    check "ws fragment assembly echo" "1" \
+        "$(echo "$wsout" | grep -c 'RECV3=echo:hello-frag b=1')"
 
-    wsout2=$(WS_PORT=18165 WS_PATH="ws" WS_MSG="close-me" WS_CLOSE=close "$TPHP_BIN" run tests/wsclient.php 2>&1)
-    RESULTS+="SKIP  ws server close frame（同上帧层遗留）"$'\n' 
+    wsout2=$(WS_PORT=18165 WS_PATH="ws" WS_MSG="close-me" "$TPHP_BIN" run tests/wsclient.php 2>&1)
+    check "ws server close frame (close-me → CLOSE bye)" "1" \
+        "$(echo "$wsout2" | grep -c 'CLOSE_EARLY=bye')"
     sleep 1   # 等 WS_CLOSE 事件经 drain 处理（onClose 计数）
-    RESULTS+="SKIP  ws onClose fired（依赖帧层修复）"$'\n' 
+    grep -q "ws-close-marker" "$LOG" \
+        && check "ws onClose fired" "ok" "ok" \
+        || check "ws onClose fired" "ok" "missing"
 
     # ---------- 窗口结束：自然退出 + stats 断言 ----------
     sleep 20   # 窗口 1（22s）收尾 → stop → STATS 行 → 自然退出
@@ -128,7 +134,10 @@ if wait_ready "$BASE/ping" 15; then
         "$([ "$r500" -ge 1 ] 2>/dev/null && echo 1 || echo 0)"
     wsc=$(num "$statsline" "ws_closed")
     wsf=$(num "$statsline" "ws_frames")
-    RESULTS+="SKIP  stats ws_closed/ws_frames（依赖帧层修复，当前 wsc="$wsc" wsf="$wsf"）"$'\n' 
+    check "stats ws_frames >= 3 (echo+frag+close-me)" "1" \
+        "$([ "$wsf" -ge 3 ] 2>/dev/null && echo 1 || echo 0)"
+    check "stats ws_closed >= 2" "1" \
+        "$([ "$wsc" -ge 2 ] 2>/dev/null && echo 1 || echo 0)"
     bts=$(num "$statsline" "bytes_sent")
     check "stats bytes_sent > 0" "1" \
         "$([ "$bts" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"

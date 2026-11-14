@@ -47,7 +47,7 @@ function register_routes($web) {
                 $s->close("bye");
                 return;
             }
-            $s->send("echo:" . $data);
+            $s->send("echo:" . $data . " b=" . $bits);
         },
         function (WebSocket $s) {
             global $__ws_closed;

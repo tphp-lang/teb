@@ -45,7 +45,9 @@ $web->run();    // 阻塞常驻（Ctrl+C 停止；对象析构自动 stop）
 ## 测试
 
 ```bash
-bash tests/run.sh        # 冒烟套件：22 项断言，约 40s
+bash tests/run.sh        # 总冒烟：22 项断言，约 40s
+bash tests/run_p0.sh     # P0 冒烟：45 项断言（流式/上传/notFound/助手/工厂/stop）
+bash tests/run_p1.sh     # P1 冒烟：30 项断言（before/静态/stats/WS 含帧层）
 ```
 
 默认使用兄弟目录引擎 `../TinyPHP.rt/build/tphp.exe`，可用 `TPHP_BIN=...` 覆盖。
@@ -55,7 +57,9 @@ bash tests/run.sh        # 冒烟套件：22 项断言，约 40s
 query/path/query/httpVersion/isSsl/remoteAddr）、header 大小写不敏感、POST
 body 回显、Response 链式配置（status/header/cookie/withHeaders）、500 兜底
 （非 Response 返回/回调抛异常）、Request 构造拦截、stop 幂等与同进程同端口
-重启（重启后需重新 `route()` 注册）、无路由静态文件直通与 404。
+重启（重启后需重新 `route()` 注册）、无路由静态文件直通与 404、before 短路/
+异常/拦静态、静态映射与穿越拒绝、stats 计数、WebSocket（握手/onOpen/onMessage
+回显与 bits/PING-PONG/分片装配/服务端 CLOSE/onClose/ws 统计）。
 
 ## 功能特性
 
@@ -261,13 +265,18 @@ $web->route("/events", function (Request $r) {
 |---|---|---|
 | `Web::before` | `(callable $cb): self` | 全局中间件，按注册序执行；返回 `null` 继续、`Response` 短路、其它类型/异常 → 500；**可拦静态文件**；before 内 `beginStream()` 走流式契约 |
 | `Web::file` | `(string $uriPrefix, string $dir): self` | 静态目录映射（多条）；匹配顺序在路由之后、nf/兜底之前；rest 逐段拒绝 `..`；目录取 `index.html`；缺失 fallthrough 不遮蔽 nf/兜底 |
-| `Web::stats` | `(): array` | `started_at`/`uptime`/`requests_total`/`requests_active`/`responses`(按状态码)/`bytes_sent`/`ws_active`/`ws_frames`/`ws_closed`；任意时刻可调，start 时复位 |
+| `Web::stats` | `(): array` | `started_at`/`uptime`/`requests_total`/`requests_active`/`responses`(按状态码)/`bytes_sent`/`ws_active`/`ws_frames`(交付的数据消息数，分片合并计 1，控制帧不计)/`ws_closed`；任意时刻可调，start 时复位 |
 | `Response::file` | `(string $path, int $status = 200, array $headers = []): Response` | 读整个文件入 body（超 `upload_max_bytes`/不可读抛 `Error`）；Content-Type 按扩展名 |
-| `Web::websocket` | `(string $uri, callable $onOpen, ?callable $onMessage = null, ?callable $onClose = null): self` | 回调签名：`onOpen(WebSocket $s, Request $r)`、`onMessage(WebSocket $s, string $data, int $bits)`、`onClose(WebSocket $s)`；onMessage 抛异常 → 关连接；onOpen/onClose 异常忽略 |
+| `Web::websocket` | `(string $uri, callable $onOpen, ?callable $onMessage = null, ?callable $onClose = null): self` | 回调签名：`onOpen(WebSocket $s, Request $r)`、`onMessage(WebSocket $s, string $data, int $bits)`（`$bits` 为消息 opcode：1=文本 2=二进制）、`onClose(WebSocket $s)`；onMessage 抛异常 → 关连接；onOpen/onClose 异常忽略；客户端 PING/PONG/CLOSE 帧不进 onMessage（PING 自动回 PONG，CLOSE 回 CLOSE 后断开） |
 | `WebSocket::send` | `(string $data, bool $binary = false): int` | 写帧（连接已关抛 `Error`） |
 | `WebSocket::ping` / `close` / `remoteAddr` | 见源码 | `close` 发 CLOSE 帧并断开（幂等） |
 
-**已知遗留（WS 帧层）**：civetweb 的 data 回调给的是原始掩码帧（未解 mask），`onMessage` 的 `$data` 当前为帧原始数据——回显类用法待下轮修帧解析（见 P1-design 教训节）。
+**已知差异（WS 帧层）**：civetweb 的 data 回调给的是**已解 mask 的单帧载荷**
+（帧首字节 FIN|RSV|opcode 在 `bits` 入参）；teb 在 drain 侧做帧层处理——
+PING 自动回 PONG、PONG 忽略、CLOSE 回 CLOSE 后断开、FIN=0 分片按连接装配后
+交付，客户端 PING/PONG/CLOSE 帧不会进 onMessage。**曾误判为"未解 mask"**，
+实为测试客户端被引擎 `^` 语义坑（字符串 `^` 返回 int，掩码拼装须用
+`chr(ord()^ord())`，教训见 P1-design 教训节）。
 
 ## 常量
 

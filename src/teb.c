@@ -12,6 +12,11 @@
  *   Tphp\Teb\UploadedFile 上传文件：form()/files() 产物，moveTo() 落盘
  *   Tphp\Teb\WebSocket    WS 连接（P1）：websocket() 回调入参，send/ping/close/remoteAddr
  *
+ * WS 帧层（RFC6455 子集，drain 侧解码）：civetweb data 回调给已解 mask 的
+ * 单帧载荷（FIN|opcode 在 bits）——控制帧不出回调：PING 自动回 PONG、PONG
+ * 忽略、CLOSE 回 CLOSE 并断连；数据帧 FIN=0 分片按 conn 装配后交付
+ * onMessage（bits=消息 opcode，1=文本 2=二进制），协议错/超限断连。
+ *
  * 线程模型（同步阻塞，2026-11-13 冒烟验证）：
  *   civetweb worker 进入 thunk/WS 回调 → 入队 → 阻塞等 done；PHP 主线程
  *   Web::run() 内部 drain 循环取批 → 构造 Request → before 链 → 路由/静态/WS
@@ -86,6 +91,15 @@ typedef struct TebWsSock {
     struct TebWsSock *next;
 } TebWsSock;
 
+/* WS 分片装配（FIN=0 数据帧累积；conn 键；仅 drain 读写 → 单线程无锁） */
+typedef struct TebWsFrag {
+    struct mg_connection *conn;
+    int opcode;                /* 首帧 opcode（TEXT/BINARY），续帧聚合后按它交付 */
+    char *buf;
+    size_t len, cap;
+    struct TebWsFrag *next;
+} TebWsFrag;
+
 /* 队列节点 kind */
 enum {
     TEQ_REQ = 0,      /* 路由/nf/兜底命中的 HTTP 请求 */
@@ -102,9 +116,9 @@ typedef struct TebRequest {
     char *path;                 /* TEQ_STATIC：文件路径（thunk 分配，drain 释放） */
     long long path_size;        /* TEQ_STATIC：文件大小（bytes_sent 近似用） */
     TebWsReg *ws_reg;           /* TEQ_WS_*：所属注册 */
-    char *ws_data;              /* TEQ_WS_MSG：帧数据拷贝（civetweb 缓冲出回调即失效） */
+    char *ws_data;              /* TEQ_WS_MSG：帧载荷拷贝（civetweb 已解 mask，出回调即失效） */
     size_t ws_data_len;
-    int ws_bits;                /* TEQ_WS_MSG：首字节 opcode */
+    int ws_bits;                /* TEQ_WS_MSG：帧首字节原值（FIN|RSV|opcode），drain 解码 */
     struct TebRequest *next;
     bool done;
 } TebRequest;
@@ -131,6 +145,7 @@ typedef struct {
     TebStatic *statics;        /* P1-3 静态目录映射（多条，头插） */
     TebWsReg *ws_regs;         /* P1-4 WS 注册（头插；stop 释放） */
     TebWsSock *ws_socks;       /* P1-4 WS 连接登记（mu 保护） */
+    TebWsFrag *ws_frags;       /* WS 分片装配（drain 独占） */
     TebRequest *req_head;      /* 挂起请求队列头 */
     TebRequest *req_tail;
     uv_mutex_t mu;             /* 保护队列 / done / shutdown / ws_socks */
@@ -1029,7 +1044,7 @@ static void teb_real_stop(void) {
     }
     g_teb.statics = NULL;
     /* P1-4 WS：全部连接登记摘链（obj props[0] 置 0 → send/close 抛 Error）
-     * + 释放引用；ws_regs 注册释放。mg_stop 已 join，单线程免锁。 */
+     * + 释放引用；ws_regs 注册释放；分片装配残留回收。mg_stop 已 join，单线程免锁。 */
     TebWsSock *pend = g_teb.ws_socks;
     g_teb.ws_socks = NULL;
     while (pend) {
@@ -1039,6 +1054,14 @@ static void teb_real_stop(void) {
         tval_release(&(TVal){ .u.p = n->obj, .t = T_OBJ });
         tm_free(n);
     }
+    TebWsFrag *wf = g_teb.ws_frags;
+    while (wf) {
+        TebWsFrag *nx = wf->next;
+        tm_free(wf->buf);
+        tm_free(wf);
+        wf = nx;
+    }
+    g_teb.ws_frags = NULL;
     for (TebWsReg *rg = g_teb.ws_regs; rg; ) {
         TebWsReg *nx = rg->next;
         if (rg->uri) tm_free(rg->uri);
@@ -1074,6 +1097,53 @@ static void teb_ws_close_conn(struct mg_connection *conn) {
         tval_release(&(TVal){ .u.p = n->obj, .t = T_OBJ });
         tm_free(n);
     }
+}
+
+/* WS 分片装配 helpers（仅 drain 调用：单线程无锁） */
+static TebWsFrag *teb_ws_frag_find(struct mg_connection *conn) {
+    for (TebWsFrag *f = g_teb.ws_frags; f; f = f->next)
+        if (f->conn == conn) return f;
+    return NULL;
+}
+
+static void teb_ws_frag_drop(struct mg_connection *conn) {
+    for (TebWsFrag **pp = &g_teb.ws_frags; *pp; pp = &(*pp)->next) {
+        if ((*pp)->conn == conn) {
+            TebWsFrag *f = *pp;
+            *pp = f->next;
+            tm_free(f->buf);
+            tm_free(f);
+            return;
+        }
+    }
+}
+
+static bool teb_ws_frag_append(TebWsFrag *f, const char *data, size_t len) {
+    if (!len) return true;
+    if (f->len + len > f->cap) {
+        size_t nc = f->cap ? f->cap : 256;
+        while (nc < f->len + len) nc *= 2;
+        char *nb = tm_realloc(f->buf, nc);
+        if (!nb) return false;
+        f->buf = nb;
+        f->cap = nc;
+    }
+    memcpy(f->buf + f->len, data, len);
+    f->len += len;
+    return true;
+}
+
+/* 连接级 close_requested：置首个登记节点 props[1]（OPEN 节点必在），
+ * ws_data_cb 醒来后返回 0 → civetweb 断开 */
+static void teb_ws_mark_closed(struct mg_connection *conn) {
+    teb_lock();
+    for (TebWsSock *n = g_teb.ws_socks; n; n = n->next) {
+        if (n->conn == conn) {
+            n->obj->props[1] = TV_TRUE;
+            break;
+        }
+    }
+    uv_mutex_unlock(&g_teb.mu);
 }
 
 /* P1-2 跑 before 链 + 分发（REQ/STATIC 共用）。返回 false = 用户回调抛异常
@@ -1134,6 +1204,46 @@ static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
         return true;
     }
     return true;
+}
+
+/* WS 数据消息交付（完整帧或分片装配完成）：现造 WebSocket + 登记 + onMessage。
+ * onMessage 抛异常 → 打印 + close_requested（data 回调返回 0 断连）。 */
+static void teb_ws_deliver_msg(VM *vm, TebWsReg *reg, struct mg_connection *conn,
+                               int opcode, const char *data, size_t len) {
+    g_teb.st.ws_frames++;
+    TObj *s = tphp_obj_alloc(g_ws_cls);
+    s->props[0] = TV_INT((int64_t)(uintptr_t)conn);
+    s->props[1] = TV_FALSE;
+    teb_lock();
+    TebWsSock *node = tm_malloc(sizeof *node);
+    node->obj = s;
+    node->conn = conn;
+    node->next = g_teb.ws_socks;
+    g_teb.ws_socks = node;
+    uv_mutex_unlock(&g_teb.mu);
+    tval_addref(TV_OBJ(s));   /* node 持有份 */
+    if (reg->on_msg.t != T_NULL) {
+        TStr *ds = tstr_new(data ? data : "", len);
+        TVal args2[3] = { TV_OBJ(s), TV_STR(ds), TV_INT(opcode) };
+        TVal out = TV_NULL;
+        if (!tphp_vm_call_bounded(vm, reg->on_msg, args2, 3, &out)) {
+            tphp_warn("PHP Warning: Teb WS onMessage callback raised "
+                      "(closing connection)\n");
+            s->props[1] = TV_TRUE;   /* close_requested → data 回调返回 0 */
+        }
+        tval_release(&out);
+        tval_release(&args2[0]);   /* node 持份保留 */
+        tval_release(&args2[1]);   /* 帧数据串（drain 持份） */
+        /* args2[2] int 无引用 */
+    }
+}
+
+/* WS 帧级写出（drain 侧；mg_lock_connection 防并发写） */
+static void teb_ws_write_frame(struct mg_connection *conn, int opcode,
+                               const char *data, size_t len) {
+    mg_lock_connection(conn);
+    mg_websocket_write(conn, opcode, data, len);
+    mg_unlock_connection(conn);
 }
 
 static void teb_drain_once(VM *vm) {
@@ -1214,36 +1324,62 @@ static void teb_drain_once(VM *vm) {
             tval_release(&args2[0]);   /* node 持份保留 */
             tval_release(&args2[1]);   /* Request 引用尽（drain 持份） */
         } else if (q->kind == TEQ_WS_MSG) {
-            g_teb.st.ws_frames++;
-            TebWsReg *reg = q->ws_reg;
-            TObj *s = tphp_obj_alloc(g_ws_cls);
-            s->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
-            s->props[1] = TV_FALSE;
-            teb_lock();
-            TebWsSock *node = tm_malloc(sizeof *node);
-            node->obj = s;
-            node->conn = q->conn;
-            node->next = g_teb.ws_socks;
-            g_teb.ws_socks = node;
-            uv_mutex_unlock(&g_teb.mu);
-            tval_addref(TV_OBJ(s));   /* node 持有份 */
-            if (reg->on_msg.t != T_NULL) {
-                TStr *ds = tstr_new(q->ws_data ? q->ws_data : "", q->ws_data_len);
-                TVal args2[3] = { TV_OBJ(s), TV_STR(ds), TV_INT(q->ws_bits) };
-                TVal out = TV_NULL;
-                if (!tphp_vm_call_bounded(vm, reg->on_msg, args2, 3, &out)) {
-                    tphp_warn("PHP Warning: Teb WS onMessage callback raised "
-                              "(closing connection)\n");
-                    s->props[1] = TV_TRUE;   /* close_requested → data 回调返回 0 */
+            /* 帧层（RFC6455 子集）：控制帧不出回调——PING 自动回 PONG、
+             * PONG 忽略、CLOSE 回 CLOSE 并断连；数据帧 FIN 分片装配后交付，
+             * bits 交付为消息 opcode（1=文本 2=二进制）。 */
+            int op = q->ws_bits & 0x0F;
+            bool fin = (q->ws_bits & 0x80) != 0;
+            const char *pay = q->ws_data ? q->ws_data : "";
+            if (op == 0x9) {                    /* PING → PONG（同载荷） */
+                teb_ws_write_frame(q->conn, MG_WEBSOCKET_OPCODE_PONG,
+                                   pay, q->ws_data_len);
+            } else if (op == 0xa) {             /* PONG → 忽略 */
+            } else if (op == 0x8) {             /* CLOSE → 回 CLOSE + 置关断 */
+                teb_ws_write_frame(q->conn, MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE,
+                                   pay, q->ws_data_len);
+                teb_ws_mark_closed(q->conn);
+            } else if (op == 0x0 || op == 0x1 || op == 0x2) {
+                TebWsFrag *fr = teb_ws_frag_find(q->conn);
+                if (op == 0x0) {                /* 续帧 */
+                    if (!fr) {                  /* 协议错：无进行中分片 → 断连 */
+                        teb_ws_mark_closed(q->conn);
+                    } else if (!teb_ws_frag_append(fr, pay, q->ws_data_len)
+                               || fr->len > (size_t)g_teb.upload_max_bytes) {
+                        teb_ws_frag_drop(q->conn);   /* 超限/ENOMEM → 断连 */
+                        teb_ws_mark_closed(q->conn);
+                    } else if (fin) {           /* 装配完成 → 交付 */
+                        teb_ws_deliver_msg(vm, q->ws_reg, q->conn,
+                                           fr->opcode, fr->buf, fr->len);
+                        teb_ws_frag_drop(q->conn);
+                    }
+                } else {                        /* 首帧 TEXT/BINARY */
+                    if (fin) {                  /* 单帧完整 → 直接交付 */
+                        teb_ws_deliver_msg(vm, q->ws_reg, q->conn,
+                                           op, pay, q->ws_data_len);
+                    } else if (fr) {            /* 协议错：分片中插新数据帧 */
+                        teb_ws_frag_drop(q->conn);
+                        teb_ws_mark_closed(q->conn);
+                    } else {
+                        fr = tm_malloc(sizeof *fr);
+                        memset(fr, 0, sizeof *fr);
+                        fr->conn = q->conn;
+                        fr->opcode = op;
+                        fr->next = g_teb.ws_frags;
+                        g_teb.ws_frags = fr;
+                        if (!teb_ws_frag_append(fr, pay, q->ws_data_len)
+                            || fr->len > (size_t)g_teb.upload_max_bytes) {
+                            teb_ws_frag_drop(q->conn);
+                            teb_ws_mark_closed(q->conn);
+                        }
+                    }
                 }
-                tval_release(&out);
-                tval_release(&args2[0]);   /* node 持份保留 */
-                tval_release(&args2[1]);   /* 帧数据串（drain 持份） */
-                /* args2[2] int 无引用 */
+            } else {                            /* 保留 opcode（3-7,B-F）→ 断连 */
+                teb_ws_mark_closed(q->conn);
             }
         } else if (q->kind == TEQ_WS_CLOSE) {
             g_teb.st.ws_active--;
             g_teb.st.ws_closed++;
+            teb_ws_frag_drop(q->conn);   /* 未装配完的分片一并回收 */
             teb_ws_close_conn(q->conn);   /* 全部登记摘链 + props[0] 置 0 */
             TebWsReg *reg = q->ws_reg;
             if (reg->on_close.t != T_NULL) {

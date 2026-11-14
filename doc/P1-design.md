@@ -159,3 +159,28 @@ $web->stats(): array;
    （`mg_set_websocket_handler_with_subprotocols`）。
 6. 优雅重启 restart / 路由与静态表热更新。
 7. 简版 session：cookie id + 服务端存储。
+
+---
+
+## 教训（帧层遗留收尾，2026-11-14）
+
+P1 落地时记录的"已知遗留（WS 帧层）"已修（teb.c drain 侧帧层 + 冒烟 30/30）。
+复盘三件事，勿重蹈：
+
+1. **"civetweb 给原始掩码帧"是误判**。逐行核对 teb 包内 civetweb.c
+   read_websocket：payload 先 `data[i] ^= mask[i & 3]` 再调 data 回调
+   （约 13636 行 apply mask → 13751 行 callback），交付的**本就是已解 mask
+   的单帧载荷**。当时回显探针看到乱码，真因在第 2 条——没有先隔离
+   客户端就把锅记给了帧层。
+2. **引擎 `^` 对两个字符串返回 int（数值 XOR），不是 PHP 的逐字节字符串
+   XOR**。`$payload[$i] ^ $maskKey[$i % 4]` 得到 int，`.` 拼接把十进制文本
+   拼进载荷 → 客户端帧长度头与实际载荷不符 → 整条流错位，服务端"看起来"
+   收到乱码。掩码/二进制拼装一律 `chr(ord(a) ^ ord(b))`。引擎侧该语义
+   偏差（PHP 应返回 string）另行立项，不在 teb 范围内。
+3. **帧层真实缺口与修法**（civetweb `enable_websocket_ping_pong` 默认 no）：
+   客户端 PING/PONG/CLOSE 帧原样漏进 data 回调、FIN=0 分片逐帧触发回调、
+   `bits` 是完整首字节（FIN|RSV|opcode）。修法在 drain 侧（PHP 主线程独占
+   写，无锁）：PING 回 PONG、PONG 忽略、CLOSE 回 CLOSE + 置 close_requested
+   （data 回调返回 0 断连）、分片按 conn 键装配（`TebWsFrag` 链，超
+   `upload_max_bytes`/协议错断连，WS_CLOSE 与 real_stop 回收），onMessage
+   的 `bits` 改交付消息 opcode（1=文本 2=二进制），`ws_frames` 只计交付消息。
