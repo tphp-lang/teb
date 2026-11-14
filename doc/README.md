@@ -254,6 +254,21 @@ $web->route("/events", function (Request $r) {
 
 **已知差异**：空文件选择器（`filename=""`）无法与文本字段区分，呈现为文本字段空值（`error=4 NO_FILE` 不可达）；`type()` 是服务端推断值。
 
+
+## P1：before / 静态文件 / stats / WebSocket（已落地）
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `Web::before` | `(callable $cb): self` | 全局中间件，按注册序执行；返回 `null` 继续、`Response` 短路、其它类型/异常 → 500；**可拦静态文件**；before 内 `beginStream()` 走流式契约 |
+| `Web::file` | `(string $uriPrefix, string $dir): self` | 静态目录映射（多条）；匹配顺序在路由之后、nf/兜底之前；rest 逐段拒绝 `..`；目录取 `index.html`；缺失 fallthrough 不遮蔽 nf/兜底 |
+| `Web::stats` | `(): array` | `started_at`/`uptime`/`requests_total`/`requests_active`/`responses`(按状态码)/`bytes_sent`/`ws_active`/`ws_frames`/`ws_closed`；任意时刻可调，start 时复位 |
+| `Response::file` | `(string $path, int $status = 200, array $headers = []): Response` | 读整个文件入 body（超 `upload_max_bytes`/不可读抛 `Error`）；Content-Type 按扩展名 |
+| `Web::websocket` | `(string $uri, callable $onOpen, ?callable $onMessage = null, ?callable $onClose = null): self` | 回调签名：`onOpen(WebSocket $s, Request $r)`、`onMessage(WebSocket $s, string $data, int $bits)`、`onClose(WebSocket $s)`；onMessage 抛异常 → 关连接；onOpen/onClose 异常忽略 |
+| `WebSocket::send` | `(string $data, bool $binary = false): int` | 写帧（连接已关抛 `Error`） |
+| `WebSocket::ping` / `close` / `remoteAddr` | 见源码 | `close` 发 CLOSE 帧并断开（幂等） |
+
+**已知遗留（WS 帧层）**：civetweb 的 data 回调给的是原始掩码帧（未解 mask），`onMessage` 的 `$data` 当前为帧原始数据——回显类用法待下轮修帧解析（见 P1-design 教训节）。
+
 ## 常量
 
 | 常量 | 值 | 说明 |

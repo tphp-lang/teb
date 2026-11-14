@@ -2,8 +2,8 @@
 
 > 设计契约见 [P0-design.md](P0-design.md)（冻结版，先读它）。本文件是执行清单。
 > 状态：**未开工**（2026-11-13 冻结，下次按此执行）。
-> P1（before/WebSocket/静态文件/stats）设计见 [P1-design.md](P1-design.md)，
-> P0 完成并验证后按其"实现顺序"一节继续。
+> P1（before/WebSocket/静态文件/stats）设计见 [P1-design.md](P1-design.md)——
+> **P1 已落地（2026-11-14）**，冒烟 run_p1.sh 23/23；帧层遗留见其教训节。
 
 ## 改动文件
 
