@@ -24,7 +24,7 @@
  *   路由匹配：精确 → 前缀 → 静态文件（前缀+存在性，thunk 内判定）→ notFound
  *   → 最长路由兜底 → return 0 交 civetweb 默认处理。
  *   回调异常/非 Response → C 侧写 500（异常信息照常打印）；流式回调返回值
- *   一律忽略（收尾契约见 P0-design §1）。
+ *   一律忽略（收尾契约见 doc/API.md Stream 节）。
  *   stats 计数全部在 PHP 主线程写（drain/回调），thunk/WS 回调线程不写 → 无锁。
  */
 #include "pkg.h"            /* tphp_ext_reg_const_str / tphp_ext_reg_fn / tphp_json_encode_c */
@@ -123,10 +123,10 @@ typedef struct TebRequest {
     bool done;
 } TebRequest;
 
-/* P1-1 运行统计（PHP 主线程独占写：drain/回调；thunk/WS 回调线程不写 → 无锁） */
+/* P1-1 运行统计（写方：drain/回调主线程 + thunk 线程入口 413 → 计数加锁） */
 typedef struct {
     int64_t started_at;         /* start 时 time(NULL)；0 = 从未启动 */
-    int64_t requests_total;     /* drain 处理过的 HTTP 请求数（含 nf/静态） */
+    int64_t requests_total;     /* 入队处理 + 入口 413 拒绝的 HTTP 请求数 */
     int64_t requests_active;    /* 本批正在处理中 */
     int64_t bytes_sent;         /* teb_wr 累计（静态直通另加文件大小，近似） */
     int64_t ws_active;
@@ -186,19 +186,26 @@ static void teb_lock(void) {
 static TVal teb_info_get(TObj *o, const char *key);
 
 /* P1-1 统一写出口：全部 PHP 侧响应写出走此（bytes_sent 累加）。
- * 仅 PHP 主线程调用（drain/回调），thunk/WS 回调线程不写 → 无锁。 */
+ * 主线程（drain/回调）与 thunk 线程（入口 413）都会调 → 计数加锁。 */
 static int teb_wr(struct mg_connection *conn, const void *buf, size_t len) {
     int n = (int)mg_write(conn, buf, (unsigned long long)len);
-    if (n > 0) g_teb.st.bytes_sent += n;
+    if (n > 0) {
+        teb_lock();
+        g_teb.st.bytes_sent += n;
+        uv_mutex_unlock(&g_teb.mu);
+    }
     return n;
 }
 
-/* P1-1 按实际写出状态码计数（resp_tab 线性表，溢出丢弃新码） */
+/* P1-1 按实际写出状态码计数（resp_tab 线性表，溢出丢弃新码）。
+ * 主线程 + thunk 线程（413）双写 → 加锁。 */
 static void teb_stat_resp(int64_t code) {
     if (code < 100 || code > 999) return;
+    teb_lock();
     for (int i = 0; i < g_teb.st.resp_n; i++) {
         if (g_teb.st.resp_tab[i].code == code) {
             g_teb.st.resp_tab[i].n++;
+            uv_mutex_unlock(&g_teb.mu);
             return;
         }
     }
@@ -207,6 +214,7 @@ static void teb_stat_resp(int64_t code) {
         g_teb.st.resp_tab[g_teb.st.resp_n].n = 1;
         g_teb.st.resp_n++;
     }
+    uv_mutex_unlock(&g_teb.mu);
 }
 
 /* ASCII 大小写不敏感整串比较 */
@@ -346,7 +354,7 @@ static TebRoute *teb_match_longest(void) {
     return best;
 }
 
-/* 匹配顺序（P0-design §3）：精确 → 前缀 → notFound → 最长兜底。
+/* 匹配顺序（README 路由匹配规则）：精确 → 前缀 → notFound → 最长兜底。
  * 全部落空返回 NULL（thunk 交回 civetweb 默认处理）。 */
 static TebRoute *teb_match_route(const char *uri) {
     TebRoute *r = teb_match_exact(uri);
@@ -458,6 +466,34 @@ static bool teb_enqueue_and_wait(TebRequest *req) {
     return ok;
 }
 
+/* ---- 请求体上限入口预检（413）----
+ * Content-Length 已声明且超 upload_max_bytes → 直接 413 不进回调、不入队。
+ * multipart 例外：保留既有超限语义（UploadedFile::error()=1 / form 中止，
+ * 见 run_p0 upload-limit 契约）；chunked/未声明长度的超限由 body() 读取时
+ * 抛 Error 兜底（teb_body_cached）。 */
+static const char TEB_413[] =
+    "HTTP/1.1 413 Request Entity Too Large\r\n"
+    "Content-Type: text/plain\r\nContent-Length: 22\r\n"
+    "Connection: close\r\n\r\nRequest Body Too Large";
+
+static bool ri_is_multipart(const struct mg_request_info *ri) {
+    for (int i = 0; i < ri->num_headers; i++) {
+        const struct mg_header *h = &ri->http_headers[i];
+        if (h->name && h->value && str_icmp(h->name, "Content-Type") &&
+            str_icontains(h->value, "multipart/form-data"))
+            return true;
+    }
+    return false;
+}
+
+static void teb_write_413(struct mg_connection *conn) {
+    teb_lock();
+    g_teb.st.requests_total++;   /* 被拒请求同样计数（与 drain 侧同锁） */
+    uv_mutex_unlock(&g_teb.mu);
+    teb_wr(conn, TEB_413, sizeof TEB_413 - 1);
+    teb_stat_resp(413);
+}
+
 /* ---- civetweb request handler thunk（同步阻塞，见文件头） ---- */
 static int teb_req_thunk(struct mg_connection *conn, void *cbdata) {
     (void)cbdata;
@@ -489,6 +525,14 @@ static int teb_req_thunk(struct mg_connection *conn, void *cbdata) {
         if (!req->route) {   /* 全无命中 → civetweb 默认处理 */
             tm_free(req);
             return 0;
+        }
+        /* body 超限预检：声明的 Content-Length 已超上限且非 multipart →
+         * 413 提前拒绝，省掉无意义的请求体传输（multipart 保留 error=1 语义） */
+        if (ri->content_length > g_teb.upload_max_bytes &&
+            !ri_is_multipart(ri)) {
+            teb_write_413(conn);
+            tm_free(req);
+            return 1;
         }
     }
 
@@ -739,7 +783,7 @@ static void teb_write_500(struct mg_connection *conn) {
     teb_stat_resp(500);
 }
 
-/* ---- 流式响应（P0-design §1） ----
+/* ---- 流式响应（doc/API.md Stream 节） ----
  * Stream props: 0=conn 1=status 2=headers 3=header_sent 4=ended */
 
 /* 惰性头发送：HTTP/1.1 <status> <reason> + 用户头 + Connection: close。
@@ -762,10 +806,14 @@ static void teb_stream_send_headers(TObj *s) {
     teb_wr(conn, "Connection: close\r\n\r\n", 21);
 }
 
-/* ---- body 缓存读取（P0-design §4：body()/json()/form() 共用 props[5]） ----
- * 首次调用读满连接（上限 upload_max_bytes，超限截断），缓存后复用。 */
+/* ---- body 缓存读取（doc/API.md Request 节：body()/json()/form() 共用 props[5]） ----
+ * 首次调用读满连接（上限 upload_max_bytes）；超限不缓存残缺数据：置
+ * props[5]=INT 超限标记后抛 Error，同请求后续读取重复抛同一异常（可捕获）。 */
 static TStr *teb_body_cached(VM *vm, TObj *o) {
-    (void)vm;
+    if (o->props[5].t == T_INT)   /* 已超限：重复读取持续抛错，不返回残缺数据 */
+        tphp_vm_raise(vm, "Error",
+                      "Tphp\\Teb\\Request: request body exceeds upload_max_bytes (%lld bytes)",
+                      (long long)g_teb.upload_max_bytes);
     if (o->props[5].t == T_STR) return (TStr *)o->props[5].u.p;
     if (o->props[0].t != T_INT) {
         TStr *s = tstr_new("", 0);
@@ -774,12 +822,24 @@ static TStr *teb_body_cached(VM *vm, TObj *o) {
     }
     struct mg_connection *conn =
         (struct mg_connection *)(uintptr_t)o->props[0].u.i;
-    size_t cap = 8192, len = 0;
     int64_t limit = g_teb.upload_max_bytes;
+    size_t cap = 8192, len = 0;
+    if ((int64_t)cap > limit) cap = (size_t)limit;   /* 上限 < 8K 时首读不越界 */
     char *buf = tm_malloc(cap);
     for (;;) {
         if (len == cap) {
-            if ((int64_t)len >= limit) break;
+            if ((int64_t)len >= limit) {
+                /* 顶到上限：探测一字节区分「恰好等于上限」与「超限」 */
+                char probe;
+                if (mg_read(conn, &probe, 1) > 0) {
+                    tm_free(buf);   /* raise 不返回：残缺缓冲先释放、不入缓存 */
+                    teb_set_slot(o, 5, TV_INT(1));
+                    tphp_vm_raise(vm, "Error",
+                                  "Tphp\\Teb\\Request: request body exceeds upload_max_bytes (%lld bytes)",
+                                  (long long)limit);
+                }
+                break;   /* 恰好等于上限：正常读完 */
+            }
             cap *= 2;
             if ((int64_t)cap > limit) cap = (size_t)limit;
             char *nb = tm_realloc(buf, cap);
@@ -796,7 +856,7 @@ static TStr *teb_body_cached(VM *vm, TObj *o) {
     return s;
 }
 
-/* ---- 文件上传（P0-design §2）----
+/* ---- 文件上传（doc/API.md UploadedFile 节）----
  * civetweb 三回调：field_found 落上一文本字段 + 文件字段生成 tmp 路径；
  * field_get 按 valuelen 累积（multipart 续块 key=NULL）；field_store 建
  * UploadedFile（超限 unlink + error=1）。
@@ -815,6 +875,8 @@ typedef struct {
     int64_t max_bytes;
     char tmp_dir[400];
     int seq;
+    bool aborted;               /* field_* 回调返回过 ABORT（驱动仍返 field_count） */
+    bool over_limit;            /* 中止原因 = 累计超 upload_max_bytes */
 } FormCtx;
 
 /* 落当前文本字段（acc → form[cur_key]）并复位 */
@@ -839,8 +901,10 @@ static int teb_form_field_found(const char *key, const char *filename,
         snprintf(fc->cur_fname, sizeof fc->cur_fname, "%s", filename);
         int n = snprintf(path, pathlen, "%s/tphp_up_%lu_%d",
                          fc->tmp_dir, (unsigned long)uv_os_getpid(), fc->seq++);
-        if (n < 0 || (size_t)n >= pathlen)
-            return MG_FORM_FIELD_STORAGE_ABORT;   /* tmp 路径超 512B */
+        if (n < 0 || (size_t)n >= pathlen) {
+            fc->aborted = true;   /* tmp 路径超 512B */
+            return MG_FORM_FIELD_STORAGE_ABORT;
+        }
         return MG_FORM_FIELD_STORAGE_STORE;
     }
     return MG_FORM_FIELD_STORAGE_GET;   /* 文本字段（cur_key 由 field_get 首块记） */
@@ -854,14 +918,21 @@ static int teb_form_field_get(const char *key, const char *value,
         snprintf(fc->cur_key, sizeof fc->cur_key, "%s", key);
         fc->acc_len = 0;
     }
-    /* 上限：单请求累计（文本字段值）超 upload_max_bytes → 中止解析 */
-    if (fc->total + (int64_t)valuelen > fc->max_bytes)
+    /* 上限：单请求累计（文本字段值）超 upload_max_bytes → 中止解析。
+     * 驱动中止后仍返回 field_count（≥0），必须自记标记供 form() 抛错。 */
+    if (fc->total + (int64_t)valuelen > fc->max_bytes) {
+        fc->aborted = true;
+        fc->over_limit = true;
         return MG_FORM_FIELD_HANDLE_ABORT;
+    }
     if (fc->acc_len + valuelen + 1 > fc->acc_cap) {
         size_t nc = fc->acc_cap ? fc->acc_cap : 256;
         while (nc < fc->acc_len + valuelen + 1) nc *= 2;
         char *na = tm_realloc(fc->acc, nc);
-        if (!na) return MG_FORM_FIELD_HANDLE_ABORT;
+        if (!na) {
+            fc->aborted = true;
+            return MG_FORM_FIELD_HANDLE_ABORT;
+        }
         fc->acc = na;
         fc->acc_cap = nc;
     }
@@ -910,8 +981,13 @@ static int teb_form_field_store(const char *path, long long file_size,
 }
 
 /* multipart 解析驱动（会耗尽 body——文档注明勿先调 body()）。
- * 结果缓存 props[2]（文本字段）与 props[3]（文件）。 */
-static void teb_form_parse_multipart(TObj *req, struct mg_connection *conn) {
+ * 成功：缓存 props[2]（文本字段）与 props[3]（文件）。
+ * 失败（驱动 rc<0，或 field_* 回调返回 ABORT——注意驱动中止后仍返
+ * field_count≥0，只能凭 fc.aborted 自记标记）：半截文本字段不入缓存；
+ * 完整接收的文件仍缓存 props[3]（drain 回收 tmp 需要，file()/files()
+ * 照常可取）；置 props[2]=INT 标记 → form() 本次与后续调用均抛 Error。 */
+static void teb_form_parse_multipart(VM *vm, TObj *req,
+                                     struct mg_connection *conn) {
     FormCtx fc;
     memset(&fc, 0, sizeof fc);
     fc.form = tarr_new();
@@ -926,7 +1002,24 @@ static void teb_form_parse_multipart(TObj *req, struct mg_connection *conn) {
     fdh.field_store = teb_form_field_store;
     fdh.user_data = &fc;
 
-    mg_handle_form_request(conn, &fdh);   /* <0 = 无效请求：已得字段照常缓存 */
+    int rc = mg_handle_form_request(conn, &fdh);
+    if (rc < 0 || fc.aborted) {
+        /* raise 不返回：先释放半截文本表与缓冲 → 落 files 缓存 → 置标记 */
+        if (fc.acc) tm_free(fc.acc);
+        TVal drop = TV_ARR(fc.form);
+        tval_release(&drop);
+        teb_set_slot(req, 3, TV_ARR(fc.files));
+        teb_set_slot(req, 2, TV_INT(fc.over_limit ? 1 : 2));
+        if (fc.over_limit)
+            tphp_vm_raise(vm, "Error",
+                          "Tphp\\Teb\\Request::form(): form data exceeds"
+                          " upload_max_bytes (%lld bytes)",
+                          (long long)g_teb.upload_max_bytes);
+        else
+            tphp_vm_raise(vm, "Error",
+                          "Tphp\\Teb\\Request::form(): multipart form"
+                          " parse failed");
+    }
     teb_form_flush_text(&fc);             /* 最后一个文本字段 */
     if (fc.acc) tm_free(fc.acc);
     teb_set_slot(req, 2, TV_ARR(fc.form));
@@ -954,7 +1047,7 @@ static void teb_reclaim_tmp(TObj *req) {
     }
 }
 
-/* ---- Response 静态工厂构建 helper（P0-design §5） ----
+/* ---- Response 静态工厂构建 helper（doc/API.md Response 静态工厂） ----
  * body/headers 为 +1 所有权转移。def_ctype：非 NULL 且用户头无
  * content-type（ci）时预置；location：非 NULL 时最后强制写入。 */
 static TObj *teb_resp_build(TStr *body, int64_t status, TArr *headers,
@@ -994,7 +1087,7 @@ static TObj *teb_resp_build(TStr *body, int64_t status, TArr *headers,
 
 /* ---- drain 核心：取批 → 构造 Request → 调回调 → 写响应 → 唤醒 ---- */
 
-/* 批末真停（P0-design §6）：shutdown+broadcast → mg_stop join → 清队列 →
+/* 批末真停（doc/API.md Web::stop）：shutdown+broadcast → mg_stop join → 清队列 →
  * 释放 web_obj 引用与 props[0] → 释放 routes + nf。不依赖 self。 */
 static void teb_real_stop(void) {
     teb_lock();
@@ -1200,7 +1293,9 @@ static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
     if (static_path) {
         mg_send_mime_file(conn, static_path, NULL);
         teb_stat_resp(200);
-        g_teb.st.bytes_sent += static_size;   /* 近似：mg_send_mime_file 内部写出不走 teb_wr */
+        teb_lock();
+        g_teb.st.bytes_sent += static_size;   /* 近似：内部写出不走 teb_wr */
+        uv_mutex_unlock(&g_teb.mu);
         return true;
     }
     return true;
@@ -1260,7 +1355,9 @@ static void teb_drain_once(VM *vm) {
         TebRequest *next = q->next;
 
         if (q->kind == TEQ_REQ || q->kind == TEQ_STATIC) {
-            g_teb.st.requests_total++;
+            teb_lock();
+            g_teb.st.requests_total++;   /* 与入口 413 计数（thunk 线程）同锁 */
+            uv_mutex_unlock(&g_teb.mu);
             g_teb.st.requests_active++;
             /* 构造回调入参 Request（不走 ctor；drain 持有其 rc）。
              * props: 0=conn 1=info 2=form_cache 3=files_cache 4=stream_obj
@@ -1492,7 +1589,7 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     memset(&g_teb.st, 0, sizeof g_teb.st);
     g_teb.st.started_at = (int64_t)time(NULL);
 
-    /* 上传自留键缺省（P0-design §2：upload_tmp_dir / upload_max_bytes） */
+    /* 上传自留键缺省（doc/API.md UploadedFile 节：upload_tmp_dir / upload_max_bytes） */
     if (g_teb.upload_tmp_dir[0] == 0) {
         char t[380];
         size_t tl = sizeof t;
@@ -1606,7 +1703,7 @@ static TVal nm_web_run(VM *vm, void *self, TVal *args, int n) {
 }
 
 /* stop(): void —— 幂等；draining 中只挂 pending_stop（回调内 stop 合法），
- * 批末由 drain 执行 teb_real_stop（P0-design §6） */
+ * 批末由 drain 执行 teb_real_stop（doc/API.md Web::stop） */
 static TVal nm_web_stop(VM *vm, void *self, TVal *args, int n) {
     (void)args; (void)n;
     TObj *o = (TObj *)self;
@@ -1654,10 +1751,12 @@ static TVal nm_web_before(VM *vm, void *self, TVal *args, int n) {
     return TV_OBJ((TObj *)self);
 }
 
-/* P1-1 stats(): array —— 运行统计；任意时刻可调（未启动全 0） */
+/* P1-1 stats(): array —— 运行统计；任意时刻可调（未启动全 0）。
+ * counters 可被 thunk 线程（413）并发更新 → 读取全程加锁。 */
 static TVal nm_web_stats(VM *vm, void *self, TVal *args, int n) {
     (void)vm; (void)self; (void)args; (void)n;
     TArr *a = tarr_new();
+    teb_lock();
     TebStats *st = &g_teb.st;
     int64_t now = (int64_t)time(NULL);
     struct KV { const char *k; int64_t v; };
@@ -1688,6 +1787,7 @@ static TVal nm_web_stats(VM *vm, void *self, TVal *args, int n) {
     TVal rk = TV_STR(tstr_intern("responses", 9));
     TVal rv = TV_ARR(rs);   /* rs rc=1 转移 */
     tarr_set(a, rk, rv);
+    uv_mutex_unlock(&g_teb.mu);
     return TV_ARR(a);       /* a rc=1 转移 */
 }
 
@@ -1843,7 +1943,7 @@ static TVal nm_req_body(VM *vm, void *self, TVal *args, int n) {
     return TV_STR(tstr_new(full->c, (size_t)max_len));
 }
 
-/* ---- 解析助手（P0-design §4）----
+/* ---- 解析助手（doc/API.md Request 节）----
  * Request props: 0=conn 1=info 2=form_cache 3=files_cache 4=stream_obj
  *                5=body_cache 6=qp_cache 7=cookie_cache
  * TV_NULL = 未解析哨兵（解析后必存 T_ARR / T_STR）。 */
@@ -2034,14 +2134,22 @@ static TVal nm_req_begin_stream(VM *vm, void *self, TVal *args, int n) {
     return TV_OBJ(s);
 }
 
-/* ---- 表单/上传（P0-design §2）----
+/* ---- 表单/上传（doc/API.md UploadedFile 节）----
  * form(): GET/HEAD → query 解析；multipart → mg_handle_form_request（耗尽
  * body，勿先调 body()）；其余 → body 缓存 urlencoded 解析。结果缓存
  * props[2]（文本字段）与 props[3]（文件，非 multipart 为空数组）。 */
 
 static TVal nm_req_form(VM *vm, void *self, TVal *args, int n) {
-    (void)vm; (void)args; (void)n;
+    (void)args; (void)n;
     TObj *o = (TObj *)self;
+    if (o->props[2].t == T_INT)   /* multipart 解析失败/超限：重复抛同一 Error */
+        tphp_vm_raise(vm, "Error",
+                      o->props[2].u.i == 1
+                          ? "Tphp\\Teb\\Request::form(): form data exceeds"
+                            " upload_max_bytes (%lld bytes)"
+                          : "Tphp\\Teb\\Request::form(): multipart form"
+                            " parse failed",
+                      (long long)g_teb.upload_max_bytes);
     if (o->props[2].t == T_ARR) {
         tval_addref(o->props[2]);
         return o->props[2];
@@ -2061,7 +2169,7 @@ static TVal nm_req_form(VM *vm, void *self, TVal *args, int n) {
                o->props[0].t == T_INT) {
         struct mg_connection *conn =
             (struct mg_connection *)(uintptr_t)o->props[0].u.i;
-        teb_form_parse_multipart(o, conn);   /* 同时缓存 props[2]/props[3] */
+        teb_form_parse_multipart(vm, o, conn);   /* 失败抛 Error；成功缓存两槽 */
     } else {
         TStr *b = teb_body_cached(vm, o);
         teb_set_slot(o, 2, TV_ARR(teb_parse_urlencoded(tstr_val(b), b->len)));
@@ -2215,7 +2323,7 @@ static TVal nm_resp_body(VM *vm, void *self, TVal *args, int n) {
     return o->props[1];
 }
 
-/* ---- Response 静态工厂（P0-design §5；native static，self=NULL） ---- */
+/* ---- Response 静态工厂（doc/API.md Response 静态工厂；native static，self=NULL） ---- */
 
 static bool resp_headers_arg(TVal *args, int n, int i, TArr **out) {
     if (n > i) {
@@ -2391,7 +2499,7 @@ static TVal nm_resp_file(VM *vm, void *self, TVal *args, int n) {
     return TV_OBJ(r);
 }
 
-/* ---- Tphp\Teb\Stream 原生方法（P0-design §1）----
+/* ---- Tphp\Teb\Stream 原生方法（doc/API.md Stream 节）----
  * props: 0=conn 1=status 2=headers 3=header_sent 4=ended */
 
 static TVal nm_stream_construct(VM *vm, void *self, TVal *args, int n) {
@@ -2463,7 +2571,7 @@ static TVal nm_stream_end(VM *vm, void *self, TVal *args, int n) {
     return TV_NULL;
 }
 
-/* ---- Tphp\Teb\UploadedFile 原生方法（P0-design §2）----
+/* ---- Tphp\Teb\UploadedFile 原生方法（doc/API.md UploadedFile 节）----
  * props: 0=name 1=type 2=tmp 3=size 4=error 5=moved */
 
 static TVal nm_upfile_construct(VM *vm, void *self, TVal *args, int n) {

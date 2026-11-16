@@ -112,6 +112,60 @@ if wait_ready "$BASE_R/ok" 15; then
     check "prefix match beats fallback" "fb-short" "$(curlp "$BASE_R/fb/other")"
     check "longest fallback route" "fb-longest" "$(curlp "$BASE_R/fbxyz")"
     check "exact beats prefix" "fb-longest" "$(curlp "$BASE_R/fb/longest-route-here")"
+
+    # ---- body 上限（smoke_routes.php upload_max_bytes=1024）----
+    BIGF=/tmp/teb_big_body.bin
+    head -c 2048 /dev/zero | tr '\0' 'x' > "$BIGF"
+
+    # stats 基线（其后紧跟一次入口 413，用于验证计数）
+    s1=$(curlp "$BASE_R/stat2")
+    r1=$(echo "$s1" | sed 's/^req=\([0-9]*\).*/\1/')
+
+    # 声明 Content-Length 超限 → 入口 413（回调不执行）
+    check "declared body > limit -> 413" "413" \
+        "$(curlp -o /dev/null -w '%{http_code}' -X POST --data-binary "@$BIGF" "$BASE_R/limit-cl")"
+
+    # 入口 413 计入 stats：s2 = 基线 + 413 请求 + s2 自身（漏计则 r1+1）
+    s2=$(curlp "$BASE_R/stat2")
+    check "413 counted in requests_total" "$((r1 + 2))" \
+        "$(echo "$s2" | sed 's/^req=\([0-9]*\).*/\1/')"
+    check "413 counted in responses" "r413=1" \
+        "$(echo "$s2" | sed 's/.*\(r413=[0-9]*\).*/\1/')"
+
+    # 请求头超 max_request_size（4096）→ civetweb 层拒绝（回调不进；
+    # 实测本版 civetweb：缓冲填满返 -2 → 400 Malformed message，非 413——
+    # 其 413 分支要求 request_len==0 且缓冲满，read_message 满即返 -2 不可达；
+    # 该错误响应由 civetweb 自出，不经 teb，不计入 stats）
+    check "header within max_request_size -> 200" "200" \
+        "$(curlp -o /dev/null -w '%{http_code}' "$BASE_R/ok")"
+    BIGH=$(head -c 5000 /dev/zero | tr '\0' 'h')
+    check "header > max_request_size -> 400" "400" \
+        "$(curlp -o /dev/null -w '%{http_code}' -H "X-Big: $BIGH" "$BASE_R/ok")"
+
+    # chunked（未声明长度）读取超限 → body() 抛 Error，两次 catch 均命中
+    check "chunked over-limit caught twice" "caught-twice" \
+        "$(curlp -X POST -H "Transfer-Encoding: chunked" --data-binary "@$BIGF" "$BASE_R/limit-ch")"
+
+    # chunked 读取超限且不 catch → 统一路径 500
+    check "chunked over-limit uncaught -> 500" "500" \
+        "$(curlp -o /dev/null -w '%{http_code}' -X POST -H "Transfer-Encoding: chunked" --data-binary "@$BIGF" "$BASE_R/limit-raw")"
+
+    # chunked 未超限照常工作（回归：上限内 body 正常读取）
+    check "chunked within limit" "m=POST body=hello-chunked" \
+        "$(curlp -X POST -H "Transfer-Encoding: chunked" --data-binary "hello-chunked" "$BASE_R/echo")"
+
+    # 恰好等于上限（1024B 声明）→ 不算超限，正常进回调
+    head -c 1024 /dev/zero | tr '\0' 'y' > "$BIGF"
+    check "body exactly at limit -> 200" "200" \
+        "$(curlp -o /dev/null -w '%{http_code}' -X POST --data-binary "@$BIGF" "$BASE_R/echo")"
+    rm -f "$BIGF"
+
+    # multipart 文本字段超限（2048B > 1024B）→ form() 抛 Error 且重复抛
+    BIGT=$(head -c 2048 /dev/zero | tr '\0' 'z')
+    check "multipart text over-limit caught twice + files ok" "form-twice files=0" \
+        "$(curlp -F "t=$BIGT" "$BASE_R/limit-form")"
+    check "multipart text over-limit uncaught -> 500" "500" \
+        "$(curlp -o /dev/null -w '%{http_code}' -F "t=$BIGT" "$BASE_R/limit-form-raw")"
 else
     check "server phase1 ready" "ready" "timeout"
 fi

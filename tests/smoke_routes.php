@@ -11,7 +11,7 @@ use Tphp\Teb\Web;
 use Tphp\Teb\Request;
 use Tphp\Teb\Response;
 
-// 全部路由注册（stop() 释放路由表，重启后需重新注册 —— 契约见 doc/README.md）
+// 全部路由注册（stop() 释放路由表，重启后需重新注册 —— 契约见 doc/API.md）
 function register_routes($web) {
     // 就绪探测 + 重启验证端点
     $web->route("/ok", fn(Request $r) => new Response("ok"));
@@ -86,6 +86,61 @@ function register_routes($web) {
     // 匹配优先级：/fb 为前缀路由，/fb/longest-route-here 为精确路由
     $web->route("/fb", fn(Request $r) => new Response("fb-short"));
     $web->route("/fb/longest-route-here", fn(Request $r) => new Response("fb-longest"));
+
+    // ---- body 上限（upload_max_bytes=1024，见 start options）----
+    // 声明 Content-Length 超限 → 入口 413，本回调不应执行
+    $web->route("/limit-cl", fn(Request $r) => new Response("limit-cl-reached"));
+
+    // chunked（未声明长度）读取超限 → body() 抛 Error，可捕获且重复抛
+    $web->route("/limit-ch", function (Request $r) {
+        try {
+            $r->body();
+        } catch (Error $e) {
+            try {
+                $r->body();   // 第二次：重复抛同一异常
+            } catch (Error $e2) {
+                return new Response("caught-twice");
+            }
+            return new Response("caught-once");
+        }
+        return new Response("no-throw");
+    });
+
+    // chunked 读取超限且不 catch → 统一路径 500
+    $web->route("/limit-raw", function (Request $r) {
+        return new Response("raw len=" . strlen($r->body()));
+    });
+
+    // ---- multipart 文本字段超限（upload_max_bytes=1024）----
+    // form() 抛 Error（可捕获、重复抛）；完整接收的文件仍可 file()/files()
+    $web->route("/limit-form", function (Request $r) {
+        try {
+            $r->form();
+        } catch (Error $e) {
+            try {
+                $r->form();   // 第二次：重复抛同一 Error
+            } catch (Error $e2) {
+                return new Response("form-twice files=" . count($r->files()));
+            }
+            return new Response("form-once");
+        }
+        return new Response("form-nothrow");
+    });
+
+    // multipart 文本字段超限未捕获 → 500
+    $web->route("/limit-form-raw", function (Request $r) {
+        $r->form();
+        return new Response("form-ok");
+    });
+
+    // stats：入口 413 计入 requests_total 与 responses["413"]
+    $web->route("/stat2", function (Request $r) use ($web): Response {
+        $s = $web->stats();
+        return new Response(
+            "req=" . $s["requests_total"] .
+            " r413=" . ($s["responses"]["413"] ?? 0)
+        );
+    });
 }
 
 $web = new Web();
@@ -94,6 +149,8 @@ register_routes($web);
 $web->start([
     "listening_ports" => "18123",
     "num_threads" => "8",
+    "upload_max_bytes" => "1024",   // body 上限测试用（/limit-* 路由）
+    "max_request_size" => "4096",   // civetweb 头缓冲（透传键）；>4096B 头 → 413 用例
 ]);
 
 // 窗口 1：驱动侧跑完全部断言
@@ -104,7 +161,8 @@ while (time() - $t0 < 20) { $web->drain(); }
 $web->stop();
 $web->stop();
 register_routes($web);   // stop 已释放路由表，重启前重新注册
-$web->start(["listening_ports" => "18123", "num_threads" => "8"]);
+$web->start(["listening_ports" => "18123", "num_threads" => "8",
+    "upload_max_bytes" => "1024", "max_request_size" => "4096"]);
 echo "restart-ok idempotent-stop-ok\n";
 
 // 窗口 2：驱动侧断言重启后仍可服务
