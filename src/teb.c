@@ -19,25 +19,51 @@
  * 忽略、CLOSE 回 CLOSE 并断连；数据帧 FIN=0 分片按 conn 装配后交付
  * onMessage（bits=消息 opcode，1=文本 2=二进制），协议错/超限断连。
  *
- * 线程模型（同步阻塞，2026-11-13 冒烟验证）：
- *   civetweb worker 进入 thunk/WS 回调 → 入队 → 阻塞等 done；PHP 主线程
- *   Web::run() 内部 drain 循环取批 → 构造 Request → before 链 → 路由/静态/WS
- *   分发 → 写响应 → 唤醒 worker。回调期间 conn 归本请求独占。
+ * 线程模型（执行池，2026-11-19 起）：
+ *   civetweb worker 进入 thunk/WS 回调 → 入队阻塞等 done。消费端两路：
+ *   主线程 Web::run()/drain()（全量节点）+ N 个执行池线程（callback_threads，
+ *   缺省 min(4,核数)；仅 HTTP 节点——WS 回调固定主线程，跨帧 global 状态
+ *   与主脚本同线程）。池线程 = 独立 runtime（worker.c 引导序：thread 内部类
+ *   → async/io/closure init → class_tab_clone → 重取 7 个 teb 类句柄 →
+ *   tphp_vm_run_closure 跑 `\Tphp\Teb\Internal::pump()` 循环）。闭包跨线程
+ *   走通用 serialize（'C' 格式，Program 进程级注册表），发布点快照成
+ *   blob、池线程按 (节点, config_gen) 缓存本地副本。共享字节码的类 ic 指向
+ *   "先解析线程"的克隆体 → 类判定走指针快路+名字兜底（teb_is_cls），引擎
+ *   tphp_class_isa 同步补跨线程克隆等价（类型检查汇合点）。
+ *   keep-alive 缺省开启（enable_keep_alive=yes 透传注入）：PHP 响应不再手写
+ *   Connection: close（Stream 无 Content-Length 例外，close 定界 + 禁复用；
+ *   413 提前拒收同样禁复用），HEAD 不发 body。
  *   路由匹配：精确 → 前缀 → 静态文件（前缀+存在性，thunk 内判定）→ notFound
  *   → 最长路由兜底 → return 0 交 civetweb 默认处理。
  *   回调异常/非 Response → C 侧写 500（异常信息照常打印）；流式回调返回值
  *   一律忽略（收尾契约见 doc/API.md Stream 节）。
- *   stats 计数全部在 PHP 主线程写（drain/回调），thunk/WS 回调线程不写 → 无锁。
- *   Session：文件读写与 GC 全部在 drain 主线程（与回调串行），无锁；Set-Cookie
- *   在写出时刻注入（正常/500/流式未发头/静态四类路径），数据 flush 挂 reclaim 后。
+ *   stats 计数全部持 g_teb.mu；会话读写持 per-sid 条带锁（open→flush 段，
+ *   同会话请求串行防丢更新，任意消费线程皆可持有）；回调期间 conn 归本
+ *   请求独占。Set-Cookie 在写出时刻注入（正常/500/流式未发头/静态四类
+ *   路径），数据 flush 挂 reclaim 后。
  */
 #include "pkg.h"            /* tphp_ext_reg_const_str / tphp_ext_reg_fn / tphp_json_encode_c */
 #include "value.h"          /* TVal / TV_* / tstr_* / tm_* */
 #include "opcode.h"         /* VM / BuiltinFn */
 #include "class.h"          /* TClass / TObj / tphp_obj_alloc / register_compile */
 #include "tphp.h"           /* tphp_warn */
+#include "ast.h"            /* AStmtList / tphp_parse_script（pump Program 编译） */
+#include "tsched.h"         /* tphp_sched_loop_init（池线程引导） */
 
-#include <uv.h>             /* uv_mutex_t / uv_cond_t / uv_fs_* / uv_os_* */
+#include <uv.h>             /* uv_mutex_t / uv_cond_t / uv_fs_* / uv_os_* / uv_thread_* */
+
+/* ---- ext/worker 同款跨线程机械（TinyPHP.rt/ext/worker/worker.c L27-48 对照）----
+ * 池线程 = 独立 runtime（thread-local VM/堆/类表克隆），闭包经通用
+ * serialize（'C' 格式，Program 进程级注册表跨线程解析）克隆，字节码只读共享。 */
+extern int tphp_vm_run_closure(Program *prog, Program **share, int n_share,
+                               TClosure *clo, TVal *main_ret);
+extern void tphp_worker_init(void);          /* worker.c 尾：本线程内部类 */
+extern void tphp_async_init(void);           /* sched.c */
+extern void tphp_io_init(void);              /* io.c */
+extern void tphp_closure_class_init(void);   /* vm.c */
+extern void gc_register(GCHead *h);          /* mem.c */
+extern Program *tphp_compile(AStmtList *ast, const char *file);
+extern void tphp_prog_freeze(Program *prog);
 
 /* civetweb 头（teb 包内 civetweb/ 目录） */
 #include "civetweb/civetweb.h"
@@ -75,6 +101,10 @@ extern bool tphp_vm_call_bounded(struct VM *vm, TVal callable, TVal *args,
 typedef struct TebRoute {
     char *uri;
     TVal callable;
+    /* 跨线程序列化 blob（pools_enabled 时在发布点生成；池线程据此重建
+     * 本地闭包副本——共享 callable 对象绝不跨线程 addref/release） */
+    char *cb_blob;
+    uint32_t cb_blob_len;
     struct TebRoute *next;
 } TebRoute;
 
@@ -91,6 +121,9 @@ typedef struct TebWsReg {
     TVal on_open;
     TVal on_msg;      /* TV_NULL = 未提供 */
     TVal on_close;    /* TV_NULL = 未提供 */
+    /* 三回调各自的跨线程序列化 blob（0=open 1=msg 2=close） */
+    char *cb_blob[3];
+    uint32_t cb_blob_len[3];
     struct TebWsReg *next;
 } TebWsReg;
 
@@ -101,7 +134,8 @@ typedef struct TebWsSock {
     struct TebWsSock *next;
 } TebWsSock;
 
-/* WS 分片装配（FIN=0 数据帧累积；conn 键；仅 drain 读写 → 单线程无锁） */
+/* WS 分片装配（FIN=0 数据帧累积；conn 键。列表结构由 ws_frag_mu 保护——
+ * 同连接帧经队列 done 协议天然串行，跨连接帧并发改链须加锁） */
 typedef struct TebWsFrag {
     struct mg_connection *conn;
     int opcode;                /* 首帧 opcode（TEXT/BINARY），续帧聚合后按它交付 */
@@ -130,6 +164,9 @@ typedef struct TebRequest {
     size_t ws_data_len;
     int ws_bits;                /* TEQ_WS_MSG：帧首字节原值（FIN|RSV|opcode），drain 解码 */
     struct TebRequest *next;
+    bool taken;                 /* 已被消费者（drain/pool）摘走：shutdown 时
+                                 * 必须等 done，不得提前放行 worker（否则
+                                 * worker 走默认处理与稍后的响应写出双写 conn） */
     bool done;
 } TebRequest;
 
@@ -149,21 +186,39 @@ typedef struct {
 typedef struct {
     bool inited;
     struct mg_context *ctx;
-    TebRoute *routes;          /* 注册的路由列表（与 ctx 解耦） */
-    TebRoute *nf;              /* notFound 回调（单条，stop 单独释放） */
-    TebRoute *befores;         /* P1-2 before 中间件链（按注册序 = 尾插） */
-    TebStatic *statics;        /* P1-3 静态目录映射（多条，头插） */
+    TebRoute *routes;          /* 注册的路由列表（与 ctx 解耦；mu 内发布+匹配读） */
+    TebRoute *nf;              /* notFound 回调（单条；替换走退休链，stop 释放） */
+    TebRoute *nf_retired;      /* 被替换的旧 nf 节点（防悬挂指针，stop 释放） */
+    TebRoute *befores;         /* P1-2 before 中间件链（按注册序 = 尾插；mu 内发布） */
+    TebStatic *statics;        /* P1-3 静态目录映射（多条，头插；mu 内发布） */
     TebWsReg *ws_regs;         /* P1-4 WS 注册（头插；stop 释放） */
     TebWsSock *ws_socks;       /* P1-4 WS 连接登记（mu 保护） */
-    TebWsFrag *ws_frags;       /* WS 分片装配（drain 独占） */
+    TebWsFrag *ws_frags;       /* WS 分片装配（ws_frag_mu 保护链表结构） */
     TebRequest *req_head;      /* 挂起请求队列头 */
     TebRequest *req_tail;
-    uv_mutex_t mu;             /* 保护队列 / done / shutdown / ws_socks */
+    uv_mutex_t mu;             /* 保护队列 / done / shutdown / ws_socks / stats /
+                                * 配置发布 / session GC 节流 */
+    uv_mutex_t ws_frag_mu;     /* ws_frags 链表结构（独立锁：不与 mu 嵌套） */
+    uv_mutex_t sess_locks[64]; /* per-sid 条带锁（sid 哈希取模；open→flush 段） */
     uv_cond_t cv;              /* worker↔drain 双向唤醒 */
     bool mu_inited;
+    bool aux_locks_inited;     /* ws_frag_mu + sess_locks 一次性初始化 */
     bool shutdown;             /* stop 置位：唤醒全部等待中的 worker */
-    bool draining;             /* PHP 主线程：drain 正在处理一批 */
+    bool draining;             /* 消费者（drain/pool 线程）正在处理一批 */
     bool pending_stop;         /* draining 中收到 stop → 批末真停 */
+    bool stop_requested;       /* 非主线程 stop()：只置标志，主线程执行真停 */
+    uv_thread_t main_tid;      /* start() 所在线程（stop 线程归属判定） */
+    uint64_t config_gen;       /* 配置代数：任一注册发布 +1（池线程重建闭包副本用） */
+    int64_t up_seq;            /* 上传 tmp 名序号（全局自增，并发 multipart 防撞名） */
+    /* 执行池：pool_n>0 时 start 创建，real_stop 按序 join */
+    uv_thread_t pool_tids[16];
+    int pool_n;
+    int64_t callback_threads;   /* start 自留键；-1=未配置（缺省 min(4,核数)），0=逃生舱 */
+    bool pools_armed;           /* 池启用：注册点序列化 blob + 池线程本地化启用 */
+    Program **share;            /* 字节码共享表（main prog + inc_progs；start 捕获，stop 释放） */
+    int n_share;
+    char *const_blob;           /* 用户常量快照（start 捕获，池首泵导入，stop 释放） */
+    uint32_t const_blob_len;
     TVal web_obj;              /* 运行中 Web 对象（+1；real_stop 释放） */
     char upload_tmp_dir[400];  /* 上传 tmp 目录（start 自留键；缺省系统 tmp） */
     int64_t upload_max_bytes;  /* 上传/单字段累计上限（缺省 64M） */
@@ -185,6 +240,17 @@ static _Thread_local TClass *g_upfile_cls;
 static _Thread_local TClass *g_ws_cls;
 static _Thread_local TClass *g_sess_cls;
 
+/* ---- 执行池状态 ---- */
+static Program *g_pump_prog;   /* 泵 Program（main 编译一次，进程级只读共享） */
+
+/* 池线程专属（主线程恒 false/空；_Thread_local 天然隔离） */
+static _Thread_local bool g_in_pool_thread = false;
+static _Thread_local bool g_consts_imported = false;
+typedef struct { const void *key; uint64_t gen; TVal local; } TebLocalCb;
+static _Thread_local TebLocalCb *g_local_cbs = NULL;
+static _Thread_local int g_local_n = 0, g_local_cap = 0;
+static _Thread_local uint64_t g_local_gen = 0;
+
 /* 首次初始化必须发生在 Web::start（PHP 主线程、mg_start 创建 worker 之前） */
 static void teb_lock(void) {
     if (!g_teb.mu_inited) {
@@ -193,6 +259,28 @@ static void teb_lock(void) {
         g_teb.mu_inited = true;
     }
     uv_mutex_lock(&g_teb.mu);
+}
+
+/* ws_frag_mu + per-sid 条带锁一次性初始化（start 内、建线程前调用，
+ * 单次赋值无竞态窗口） */
+static void teb_aux_locks_init(void) {
+    if (g_teb.aux_locks_inited) return;
+    uv_mutex_init(&g_teb.ws_frag_mu);
+    for (int i = 0; i < 64; i++) uv_mutex_init(&g_teb.sess_locks[i]);
+    g_teb.aux_locks_inited = true;
+}
+
+/* per-sid 条带锁（open 持有 → flush 释放；覆盖整个请求的读-改-写段，
+ * 同会话请求串行 = PHP file session 独占锁同语义，防丢更新） */
+static void teb_sess_lock(const char *sid, size_t len) {
+    unsigned h = 2166136261u;
+    for (size_t i = 0; i < len; i++) { h ^= (unsigned char)sid[i]; h *= 16777619u; }
+    uv_mutex_lock(&g_teb.sess_locks[h & 63]);
+}
+static void teb_sess_unlock(const char *sid, size_t len) {
+    unsigned h = 2166136261u;
+    for (size_t i = 0; i < len; i++) { h ^= (unsigned char)sid[i]; h *= 16777619u; }
+    uv_mutex_unlock(&g_teb.sess_locks[h & 63]);
 }
 
 /* ---- 基础设施 helpers ---- */
@@ -206,6 +294,9 @@ static TVal teb_info_get(TObj *o, const char *key);
 static TObj *teb_sess_of(TObj *req);
 static char *teb_sess_cookie_line(TObj *sess);
 static void teb_session_flush(TObj *req);
+
+/* 执行池（定义于 drain 区）：单条完整处理（drain 批内与池泵共用） */
+static void teb_process_one(VM *vm, TebRequest *q);
 
 /* P1-1 统一写出口：全部 PHP 侧响应写出走此（bytes_sent 累加）。
  * 主线程（drain/回调）与 thunk 线程（入口 413）都会调 → 计数加锁。 */
@@ -237,6 +328,14 @@ static void teb_stat_resp(int64_t code) {
         g_teb.st.resp_n++;
     }
     uv_mutex_unlock(&g_teb.mu);
+}
+
+/* 类判定（跨线程执行安全）：池线程共享字节码的类内联缓存（ic）指向
+ * "先解析线程"的克隆类——同名不同指针。指针快路（本线程分配的对象，
+ * 常规路径零开销）+ 名字兜底（PHP 代码里 new 出来的跨线程类实例）。 */
+static bool teb_is_cls(TObj *o, TClass *c, const char *nm) {
+    if (!o || !o->cls) return false;
+    return o->cls == c || tstr_case_eq(tstr_val(o->cls->name), nm);
 }
 
 /* ASCII 大小写不敏感整串比较 */
@@ -377,12 +476,16 @@ static TebRoute *teb_match_longest(void) {
 }
 
 /* 匹配顺序（README 路由匹配规则）：精确 → 前缀 → notFound → 最长兜底。
- * 全部落空返回 NULL（thunk 交回 civetweb 默认处理）。 */
+ * 全部落空返回 NULL（thunk 交回 civetweb 默认处理）。
+ * 整段在 mu 内（worker 线程匹配 vs 主线程注册并发读写链表）；返回节点
+ * 发布后不改不删（生命周期到 stop），锁外使用安全。三个 helper 仅此处调用。 */
 static TebRoute *teb_match_route(const char *uri) {
+    teb_lock();
     TebRoute *r = teb_match_exact(uri);
     if (!r) r = teb_match_prefix(uri);
     if (!r) r = g_teb.nf;
     if (!r) r = teb_match_longest();
+    uv_mutex_unlock(&g_teb.mu);
     return r;
 }
 
@@ -402,11 +505,16 @@ static bool teb_fs_stat(const char *path, bool *is_dir, long long *size) {
 
 /* decoded uri 对 statics 链做前缀匹配；命中（文件/目录 index.html 存在）
  * 返回 true 并经 out_path（tm_malloc，drain 释放）交出路径。rest 逐段
- * 拒绝 ".."（防穿越）；条目按注册序，首个命中即用。 */
+ * 拒绝 ".."（防穿越）；条目按注册序，首个命中即用。
+ * 头指针在 mu 内快照，锁外遍历——statics 是头插发布，节点 next 发布后
+ * 不可变（只有全局头变），链上读安全；stat 不持锁。 */
 static bool teb_static_match(const char *uri, char **out_path, long long *out_size) {
     if (!uri) return false;
     size_t lu = strlen(uri);
-    for (TebStatic *ts = g_teb.statics; ts; ts = ts->next) {
+    teb_lock();
+    TebStatic *ts0 = g_teb.statics;
+    uv_mutex_unlock(&g_teb.mu);
+    for (TebStatic *ts = ts0; ts; ts = ts->next) {
         size_t lp = strlen(ts->prefix);
         if (lu < lp || strncmp(uri, ts->prefix, lp) != 0) continue;
         if (uri[lp] != 0 && uri[lp] != '/') continue;
@@ -468,13 +576,13 @@ static bool teb_enqueue_and_wait(TebRequest *req) {
     g_teb.req_tail = req;
     uv_cond_broadcast(&g_teb.cv);     /* 唤醒阻塞中的 drain */
 
-    /* 等待 PHP 侧处理完（done）或服务器停止（shutdown） */
-    while (!req->done && !g_teb.shutdown)
+    /* 等待 PHP 侧处理完（done）或服务器停止（shutdown 且未被摘走）。
+     * taken 的节点必须等 done——消费者已持该 conn，提前放行会双写。 */
+    while (!req->done && !(g_teb.shutdown && !req->taken))
         uv_cond_wait(&g_teb.cv, &g_teb.mu);
     bool ok = req->done;
     if (!ok) {
-        /* shutdown 且尚未被 drain 摘走：把自己从队列摘除（drain 与 stop
-         * 同在 PHP 主线程，不存在"处理中"竞态） */
+        /* shutdown 且尚未被摘走：把自己从队列摘除 */
         for (TebRequest **pp = &g_teb.req_head; *pp; pp = &(*pp)->next)
             if (*pp == req) { *pp = req->next; break; }
         if (g_teb.req_tail == req) {
@@ -953,7 +1061,6 @@ typedef struct {
     int64_t total;              /* 全局累计字节 */
     int64_t max_bytes;
     char tmp_dir[400];
-    int seq;
     bool aborted;               /* field_* 回调返回过 ABORT（驱动仍返 field_count） */
     bool over_limit;            /* 中止原因 = 累计超 upload_max_bytes */
 } FormCtx;
@@ -975,11 +1082,16 @@ static int teb_form_field_found(const char *key, const char *filename,
     teb_form_flush_text(fc);   /* 上一文本字段收尾 */
 
     if (filename && filename[0]) {
-        /* 文件字段：记字段名/申报名，生成 <tmp_dir>/tphp_up_<pid>_<seq> */
+        /* 文件字段：记字段名/申报名，生成 <tmp_dir>/tphp_up_<pid>_<seq>。
+         * seq 取全局自增（mu 内）——并发 multipart 各请求从 0 起会撞名 */
         snprintf(fc->cur_fkey, sizeof fc->cur_fkey, "%s", key ? key : "");
         snprintf(fc->cur_fname, sizeof fc->cur_fname, "%s", filename);
-        int n = snprintf(path, pathlen, "%s/tphp_up_%lu_%d",
-                         fc->tmp_dir, (unsigned long)uv_os_getpid(), fc->seq++);
+        teb_lock();
+        int64_t seq = g_teb.up_seq++;
+        uv_mutex_unlock(&g_teb.mu);
+        int n = snprintf(path, pathlen, "%s/tphp_up_%lu_%lld",
+                         fc->tmp_dir, (unsigned long)uv_os_getpid(),
+                         (long long)seq);
         if (n < 0 || (size_t)n >= pathlen) {
             fc->aborted = true;   /* tmp 路径超 512B */
             return MG_FORM_FIELD_STORAGE_ABORT;
@@ -1116,7 +1228,7 @@ static void teb_reclaim_tmp(TObj *req) {
         TVal v = a->data[bk->val_off];
         if (v.t != T_OBJ) continue;
         TObj *uf = (TObj *)v.u.p;
-        if (uf->cls != g_upfile_cls) continue;
+        if (!teb_is_cls(uf, g_upfile_cls, "Tphp\\Teb\\UploadedFile")) continue;
         if (uf->props[5].t == T_TRUE) continue;
         if (uf->props[2].t != T_STR) continue;
         TStr *t = (TStr *)uf->props[2].u.p;
@@ -1166,13 +1278,19 @@ static TObj *teb_resp_build(TStr *body, int64_t status, TArr *headers,
 
 /* ---- drain 核心：取批 → 构造 Request → 调回调 → 写响应 → 唤醒 ---- */
 
-/* 批末真停（doc/API.md Web::stop）：shutdown+broadcast → mg_stop join → 清队列 →
- * 释放 web_obj 引用与 props[0] → 释放 routes + nf。不依赖 self。 */
+/* 批末真停（doc/API.md Web::stop）：shutdown+broadcast → join 执行池 →
+ * mg_stop join → 清队列 → 释放 web_obj 引用与 props[0] → 释放配置（含
+ * nf 退休链）。不依赖 self。顺序约束：所有消费者（池/主线程）都必须在
+ * mg_stop 与配置释放之前退出，否则会踩在飞请求或悬挂配置指针上。 */
 static void teb_real_stop(void) {
     teb_lock();
     g_teb.shutdown = true;
     uv_cond_broadcast(&g_teb.cv);
     uv_mutex_unlock(&g_teb.mu);
+
+    for (int i = 0; i < g_teb.pool_n; i++)   /* 执行池（批3 创建；0 时空转） */
+        uv_thread_join(&g_teb.pool_tids[i]);
+    g_teb.pool_n = 0;
 
     mg_stop(g_teb.ctx);   /* join 全部 worker；此后队列必为空 */
     g_teb.ctx = NULL;
@@ -1188,19 +1306,30 @@ static void teb_real_stop(void) {
     for (TebRoute *r = g_teb.routes; r; ) {
         TebRoute *nx = r->next;
         if (r->uri) tm_free(r->uri);
+        if (r->cb_blob) tm_free(r->cb_blob);
         tval_release(&r->callable);
         tm_free(r);
         r = nx;
     }
     g_teb.routes = NULL;
     if (g_teb.nf) {
+        if (g_teb.nf->cb_blob) tm_free(g_teb.nf->cb_blob);
         tval_release(&g_teb.nf->callable);
         tm_free(g_teb.nf);
         g_teb.nf = NULL;
     }
+    for (TebRoute *nr = g_teb.nf_retired; nr; ) {   /* 被替换的旧 nf */
+        TebRoute *nx = nr->next;
+        if (nr->cb_blob) tm_free(nr->cb_blob);
+        tval_release(&nr->callable);
+        tm_free(nr);
+        nr = nx;
+    }
+    g_teb.nf_retired = NULL;
     /* P1-2 before 链 */
     for (TebRoute *b = g_teb.befores; b; ) {
         TebRoute *nx = b->next;
+        if (b->cb_blob) tm_free(b->cb_blob);
         tval_release(&b->callable);
         tm_free(b);
         b = nx;
@@ -1237,6 +1366,8 @@ static void teb_real_stop(void) {
     for (TebWsReg *rg = g_teb.ws_regs; rg; ) {
         TebWsReg *nx = rg->next;
         if (rg->uri) tm_free(rg->uri);
+        for (int i = 0; i < 3; i++)
+            if (rg->cb_blob[i]) tm_free(rg->cb_blob[i]);
         tval_release(&rg->on_open);
         tval_release(&rg->on_msg);
         tval_release(&rg->on_close);
@@ -1244,6 +1375,24 @@ static void teb_real_stop(void) {
         rg = nx;
     }
     g_teb.ws_regs = NULL;
+    /* 执行池快照释放（join 与 mg_stop 已在上方完成 → 无线程再读） */
+    if (g_teb.share) { tm_free(g_teb.share); g_teb.share = NULL; }
+    g_teb.n_share = 0;
+    if (g_teb.const_blob) { tm_free(g_teb.const_blob); g_teb.const_blob = NULL; }
+    g_teb.const_blob_len = 0;
+    g_teb.pools_armed = false;
+}
+
+/* 非主线程 stop() 的信号轮询（run/drain 每轮调用）：主线程执行真停 */
+static void teb_poll_stop_request(void) {
+    bool s = false;
+    teb_lock();
+    if (g_teb.stop_requested) {
+        s = true;
+        g_teb.stop_requested = false;
+    }
+    uv_mutex_unlock(&g_teb.mu);
+    if (s && g_teb.ctx) teb_real_stop();
 }
 
 /* P1-4 摘除某连接的全部 WS 登记（mu 内摘链置 0，锁外释放引用） */
@@ -1271,23 +1420,34 @@ static void teb_ws_close_conn(struct mg_connection *conn) {
     }
 }
 
-/* WS 分片装配 helpers（仅 drain 调用：单线程无锁） */
+/* WS 分片装配 helpers：链表结构走 ws_frag_mu（同连接帧经队列 done 协议
+ * 天然串行，节点 buffer 归本连接线程私有——append 免锁） */
+
+static void teb_frag_lock(void) { uv_mutex_lock(&g_teb.ws_frag_mu); }
+static void teb_frag_unlock(void) { uv_mutex_unlock(&g_teb.ws_frag_mu); }
+
 static TebWsFrag *teb_ws_frag_find(struct mg_connection *conn) {
+    teb_frag_lock();
+    TebWsFrag *r = NULL;
     for (TebWsFrag *f = g_teb.ws_frags; f; f = f->next)
-        if (f->conn == conn) return f;
-    return NULL;
+        if (f->conn == conn) { r = f; break; }
+    teb_frag_unlock();
+    return r;
 }
 
 static void teb_ws_frag_drop(struct mg_connection *conn) {
+    teb_frag_lock();
     for (TebWsFrag **pp = &g_teb.ws_frags; *pp; pp = &(*pp)->next) {
         if ((*pp)->conn == conn) {
             TebWsFrag *f = *pp;
             *pp = f->next;
+            teb_frag_unlock();
             tm_free(f->buf);
             tm_free(f);
             return;
         }
     }
+    teb_frag_unlock();
 }
 
 static bool teb_ws_frag_append(TebWsFrag *f, const char *data, size_t len) {
@@ -1318,24 +1478,111 @@ static void teb_ws_mark_closed(struct mg_connection *conn) {
     uv_mutex_unlock(&g_teb.mu);
 }
 
+/* ---- 执行池：配置 blob 快照与回调本地化 ----
+ * 发布点（main，mu 内或 start）把回调 serialize 成 C 字节 blob；池线程
+ * 按 (节点指针, config_gen) 缓存本地闭包副本（本线程堆/gc_list 独享），
+ * 换代整体作废重建。主线程永远直用共享 callable（g_in_pool_thread=false）。 */
+
+/* serialize 一个回调进节点 blob（覆盖前释放旧的）。vm 传当前主线程——
+ * 'C' 格式顺带 freeze owner Program + 进程级注册（池线程按 id 解析）。 */
+static void teb_snapshot_cb(TVal cb, char **blob_out, uint32_t *len_out) {
+    if (*blob_out) { tm_free(*blob_out); *blob_out = NULL; *len_out = 0; }
+    TStr *s = tphp_serialize_val((VM *)tphp_vm_current, cb);
+    if (!s) return;
+    char *b = tm_malloc(s->len ? s->len : 1);
+    memcpy(b, tstr_val(s), s->len);
+    *blob_out = b;
+    *len_out = (uint32_t)s->len;
+    tval_release(&(TVal){ .t = T_STR, .u.p = s });
+}
+
+/* 取可用于调用的回调（+1）：主线程 = 共享对象 addref；池线程 = 反序列化
+ * 本地副本（缓存，换代失效）。unserialize 失败 → raise（发布点预序列化
+ * 保证正常不发生）。 */
+static TVal teb_cb_acquire(VM *vm, const void *key, TVal shared,
+                           const char *blob, uint32_t blen) {
+    if (!g_in_pool_thread || !blob || blen == 0) {
+        tval_addref(shared);
+        return shared;
+    }
+    teb_lock();
+    uint64_t gen = g_teb.config_gen;
+    uv_mutex_unlock(&g_teb.mu);
+    if (gen != g_local_gen) {   /* 配置换代：释放旧本地副本（本线程拥有） */
+        for (int i = 0; i < g_local_n; i++) tval_release(&g_local_cbs[i].local);
+        g_local_n = 0;
+        g_local_gen = gen;
+    }
+    for (int i = 0; i < g_local_n; i++) {
+        if (g_local_cbs[i].key == key) {
+            tval_addref(g_local_cbs[i].local);
+            return g_local_cbs[i].local;
+        }
+    }
+    TVal out = TV_NULL;
+    if (!tphp_unserialize_val(NULL, blob, blen, &out))
+        tphp_vm_raise(vm, "Error",
+                      "Teb: failed to rebuild route callback in pool thread");
+    if (g_local_n == g_local_cap) {
+        g_local_cap = g_local_cap ? g_local_cap * 2 : 16;
+        g_local_cbs = tm_realloc(g_local_cbs,
+                                 sizeof(TebLocalCb) * (size_t)g_local_cap);
+    }
+    g_local_cbs[g_local_n].key = key;
+    g_local_cbs[g_local_n].gen = gen;
+    g_local_cbs[g_local_n].local = out;   /* 存 +1（unserialize 归本线程） */
+    g_local_n++;
+    tval_addref(out);                    /* 调用方份 */
+    return out;
+}
+
+/* 池线程退出前释放本地闭包缓存（含捕获对象——必须在本线程释放，F1 规则） */
+static void teb_local_cache_free(void) {
+    for (int i = 0; i < g_local_n; i++) tval_release(&g_local_cbs[i].local);
+    tm_free(g_local_cbs);
+    g_local_cbs = NULL;
+    g_local_n = g_local_cap = 0;
+    g_local_gen = 0;
+}
+
 /* P1-2 跑 before 链 + 分发（REQ/STATIC 共用）。返回 false = 用户回调抛异常
  * （响应由外层按流式状态收尾）；true = 响应已写出或流式接管。 */
 static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
                          TebRoute *route, const char *static_path,
                          long long static_size) {
     /* before 链（按注册序）；任一 before 内 beginStream → 后续 before 与
-     * 路由/静态全部跳过（外层流式收尾） */
-    for (TebRoute *b = g_teb.befores; b; b = b->next) {
-        if (req->props[4].t == T_OBJ) return true;
+     * 路由/静态全部跳过（外层流式收尾）。
+     * 先在 mu 内快照节点指针数组再锁外执行——尾插发布的链表 next 会随
+     * 并发注册变化，持锁跨回调也无法安全边走边读；节点到 stop 前不释放。 */
+    int n_before = 0;
+    teb_lock();
+    for (TebRoute *b = g_teb.befores; b; b = b->next) n_before++;
+    uv_mutex_unlock(&g_teb.mu);
+    TebRoute **bs = n_before
+        ? tm_malloc(sizeof(TebRoute *) * (size_t)n_before) : NULL;
+    int bi = 0;
+    teb_lock();
+    for (TebRoute *b = g_teb.befores; b && bi < n_before; b = b->next)
+        bs[bi++] = b;
+    uv_mutex_unlock(&g_teb.mu);
+    n_before = bi;
+
+    for (int i = 0; i < n_before; i++) {
+        TebRoute *b = bs[i];
+        if (req->props[4].t == T_OBJ) { tm_free(bs); return true; }
         TVal argv = TV_OBJ(req);
         tval_addref(argv);
         TVal out = TV_NULL;
-        bool ok = tphp_vm_call_bounded(vm, b->callable, &argv, 1, &out);
+        TVal cb = teb_cb_acquire(vm, b, b->callable, b->cb_blob, b->cb_blob_len);
+        bool ok = tphp_vm_call_bounded(vm, cb, &argv, 1, &out);
+        tval_release(&cb);
         tval_release(&argv);
-        if (!ok) return false;   /* before 异常：外层按流式状态收尾 */
-        if (out.t == T_OBJ && ((TObj *)out.u.p)->cls == g_resp_cls) {
+        if (!ok) { tm_free(bs); return false; }   /* before 异常：外层按流式状态收尾 */
+        if (out.t == T_OBJ && teb_is_cls((TObj *)out.u.p, g_resp_cls,
+                                         "Tphp\\Teb\\Response")) {
             teb_write_response(conn, (TObj *)out.u.p, req);   /* 短路 */
             tval_release(&out);
+            tm_free(bs);
             return true;
         }
         if (out.t != T_NULL) {
@@ -1343,20 +1590,26 @@ static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
                       "or a Tphp\\Teb\\Response instance\n");
             tval_release(&out);
             teb_write_500(conn, req);
+            tm_free(bs);
             return true;
         }
         tval_release(&out);
     }
+    tm_free(bs);
     if (req->props[4].t == T_OBJ) return true;   /* before 内 beginStream */
 
     if (route) {
         TVal argv = TV_OBJ(req);
         tval_addref(argv);
         TVal out = TV_NULL;
-        bool ok = tphp_vm_call_bounded(vm, route->callable, &argv, 1, &out);
+        TVal cb = teb_cb_acquire(vm, route, route->callable,
+                                 route->cb_blob, route->cb_blob_len);
+        bool ok = tphp_vm_call_bounded(vm, cb, &argv, 1, &out);
+        tval_release(&cb);
         tval_release(&argv);
         if (!ok) return false;   /* route 异常：外层按流式状态收尾 */
-        if (out.t == T_OBJ && ((TObj *)out.u.p)->cls == g_resp_cls) {
+        if (out.t == T_OBJ && teb_is_cls((TObj *)out.u.p, g_resp_cls,
+                                         "Tphp\\Teb\\Response")) {
             teb_write_response(conn, (TObj *)out.u.p, req);
         } else if (req->props[4].t == T_OBJ) {
             /* 流式接管：返回值一律忽略 */
@@ -1388,7 +1641,9 @@ static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
  * onMessage 抛异常 → 打印 + close_requested（data 回调返回 0 断连）。 */
 static void teb_ws_deliver_msg(VM *vm, TebWsReg *reg, struct mg_connection *conn,
                                int opcode, const char *data, size_t len) {
+    teb_lock();
     g_teb.st.ws_frames++;
+    uv_mutex_unlock(&g_teb.mu);
     TObj *s = tphp_obj_alloc(g_ws_cls);
     s->props[0] = TV_INT((int64_t)(uintptr_t)conn);
     s->props[1] = TV_FALSE;
@@ -1404,11 +1659,14 @@ static void teb_ws_deliver_msg(VM *vm, TebWsReg *reg, struct mg_connection *conn
         TStr *ds = tstr_new(data ? data : "", len);
         TVal args2[3] = { TV_OBJ(s), TV_STR(ds), TV_INT(opcode) };
         TVal out = TV_NULL;
-        if (!tphp_vm_call_bounded(vm, reg->on_msg, args2, 3, &out)) {
+        TVal mcb = teb_cb_acquire(vm, &reg->on_msg, reg->on_msg,
+                                  reg->cb_blob[1], reg->cb_blob_len[1]);
+        if (!tphp_vm_call_bounded(vm, mcb, args2, 3, &out)) {
             tphp_warn("PHP Warning: Teb WS onMessage callback raised "
                       "(closing connection)\n");
             s->props[1] = TV_TRUE;   /* close_requested → data 回调返回 0 */
         }
+        tval_release(&mcb);
         tval_release(&out);
         tval_release(&args2[0]);   /* node 持份保留 */
         tval_release(&args2[1]);   /* 帧数据串（drain 持份） */
@@ -1424,13 +1682,46 @@ static void teb_ws_write_frame(struct mg_connection *conn, int opcode,
     mg_unlock_connection(conn);
 }
 
-static void teb_drain_once(VM *vm) {
+static void teb_drain_mode(VM *vm, int mode) {
+    /* mode 0 = 全部节点（主线程 drain/run，含 WS）；mode 1 = 仅 HTTP 节点
+     * （池泵专用：WS 回调固定主线程——跨帧/跨连接的 global 状态（房间表等）
+     * 与主脚本种子保持同线程，用户"跨回调共享状态用 global"的既有心智不破）。 */
     teb_lock();
-    TebRequest *q = g_teb.req_head;
-    if (!q && !g_teb.shutdown)
+    TebRequest *q = NULL;
+    bool waited = false;
+    for (;;) {
+        q = NULL;
+        if (mode == 0) {
+            q = g_teb.req_head;
+            if (q) g_teb.req_head = g_teb.req_tail = NULL;
+        } else {
+            /* 摘出全部非 WS 节点（保持原序）；WS 留队给主线程 */
+            TebRequest *h = NULL, **tp = &h;
+            for (TebRequest **pp = &g_teb.req_head; *pp; ) {
+                TebRequest *n = *pp;
+                if (n->kind == TEQ_REQ || n->kind == TEQ_STATIC) {
+                    *pp = n->next;
+                    n->next = NULL;
+                    *tp = n;
+                    tp = &n->next;
+                } else {
+                    pp = &n->next;
+                }
+            }
+            q = h;
+            /* 队尾重算（摘走尾节点时 req_tail 会悬空） */
+            g_teb.req_tail = NULL;
+            for (TebRequest *r = g_teb.req_head; r; r = r->next)
+                if (!r->next) { g_teb.req_tail = r; break; }
+        }
+        if (q || g_teb.shutdown || waited) break;
+        /* 单次泵语义：至多一次 10ms 等待，随后无论有无货都返回——
+         * drain() 空队阻塞到"有请求"会卡死所有窗口驱动的用户脚本。 */
+        waited = true;
         uv_cond_timedwait(&g_teb.cv, &g_teb.mu, 10 * 1000 * 1000);  /* 10ms */
-    q = g_teb.req_head;
-    g_teb.req_head = g_teb.req_tail = NULL;
+    }
+    /* mu 内整批标记 taken：此后 shutdown 不得提前放行对应 worker */
+    for (TebRequest *t = q; t; t = t->next) t->taken = true;
     g_teb.draining = true;
     uv_mutex_unlock(&g_teb.mu);
 
@@ -1440,9 +1731,9 @@ static void teb_drain_once(VM *vm) {
         if (q->kind == TEQ_REQ || q->kind == TEQ_STATIC) {
             teb_lock();
             g_teb.st.requests_total++;   /* 与入口 413 计数（thunk 线程）同锁 */
-            uv_mutex_unlock(&g_teb.mu);
             g_teb.st.requests_active++;
-            /* 构造回调入参 Request（不走 ctor；drain 持有其 rc）。
+            uv_mutex_unlock(&g_teb.mu);
+            /* 构造回调入参 Request（不走 ctor；消费者持有其 rc）。
              * props: 0=conn 1=info 2=form_cache 3=files_cache 4=stream_obj
              *        5=body_cache 6=qp_cache 7=cookie_cache 8=session */
             TObj *req = tphp_obj_alloc(g_req_cls);
@@ -1455,7 +1746,9 @@ static void teb_drain_once(VM *vm) {
                                    q->path_size);
 
             TVal sv = req->props[4];   /* beginStream 过（before 或 route）？ */
-            TObj *stream = (sv.t == T_OBJ && ((TObj *)sv.u.p)->cls == g_stream_cls)
+            TObj *stream = (sv.t == T_OBJ &&
+                            teb_is_cls((TObj *)sv.u.p, g_stream_cls,
+                                       "Tphp\\Teb\\Stream"))
                 ? (TObj *)sv.u.p : NULL;
             if (stream) {
                 /* 流式契约：返回值一律忽略；未 end 自动收尾；
@@ -1478,9 +1771,13 @@ static void teb_drain_once(VM *vm) {
             teb_reclaim_tmp(req);      /* 未 moveTo 的上传 tmp 回收 */
             teb_session_flush(req);    /* 会话落盘（dispatch 全分支必经此点） */
             tval_release(&argv);   /* Request 对象（回调捕获则继续存活） */
+            teb_lock();
             g_teb.st.requests_active--;
+            uv_mutex_unlock(&g_teb.mu);
         } else if (q->kind == TEQ_WS_OPEN) {
+            teb_lock();
             g_teb.st.ws_active++;
+            uv_mutex_unlock(&g_teb.mu);
             TebWsReg *reg = q->ws_reg;
             TObj *s = tphp_obj_alloc(g_ws_cls);
             s->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
@@ -1499,8 +1796,11 @@ static void teb_drain_once(VM *vm) {
             rq->props[1] = TV_ARR(teb_req_info_arr(q->conn));
             TVal args2[2] = { TV_OBJ(s), TV_OBJ(rq) };
             TVal out = TV_NULL;
-            if (!tphp_vm_call_bounded(vm, reg->on_open, args2, 2, &out))
+            TVal ocb = teb_cb_acquire(vm, &reg->on_open, reg->on_open,
+                                      reg->cb_blob[0], reg->cb_blob_len[0]);
+            if (!tphp_vm_call_bounded(vm, ocb, args2, 2, &out))
                 tphp_warn("PHP Warning: Teb WS onOpen callback raised (ignored)\n");
+            tval_release(&ocb);
             tval_release(&out);
             tval_release(&args2[0]);   /* node 持份保留 */
             teb_session_flush(rq);     /* WS 无 HTTP 响应可注入；数据照常落盘 */
@@ -1546,8 +1846,10 @@ static void teb_drain_once(VM *vm) {
                         memset(fr, 0, sizeof *fr);
                         fr->conn = q->conn;
                         fr->opcode = op;
+                        teb_frag_lock();
                         fr->next = g_teb.ws_frags;
                         g_teb.ws_frags = fr;
+                        teb_frag_unlock();
                         if (!teb_ws_frag_append(fr, pay, q->ws_data_len)
                             || fr->len > (size_t)g_teb.upload_max_bytes) {
                             teb_ws_frag_drop(q->conn);
@@ -1559,8 +1861,10 @@ static void teb_drain_once(VM *vm) {
                 teb_ws_mark_closed(q->conn);
             }
         } else if (q->kind == TEQ_WS_CLOSE) {
+            teb_lock();
             g_teb.st.ws_active--;
             g_teb.st.ws_closed++;
+            uv_mutex_unlock(&g_teb.mu);
             teb_ws_frag_drop(q->conn);   /* 未装配完的分片一并回收 */
             teb_ws_close_conn(q->conn);   /* 全部登记摘链 + props[0] 置 0 */
             TebWsReg *reg = q->ws_reg;
@@ -1571,8 +1875,11 @@ static void teb_drain_once(VM *vm) {
                 s->props[1] = TV_TRUE;
                 TVal args2[1] = { TV_OBJ(s) };
                 TVal out = TV_NULL;
-                if (!tphp_vm_call_bounded(vm, reg->on_close, args2, 1, &out))
+                TVal ccb = teb_cb_acquire(vm, &reg->on_close, reg->on_close,
+                                          reg->cb_blob[2], reg->cb_blob_len[2]);
+                if (!tphp_vm_call_bounded(vm, ccb, args2, 1, &out))
                     tphp_warn("PHP Warning: Teb WS onClose callback raised (ignored)\n");
+                tval_release(&ccb);
                 tval_release(&out);
                 tval_release(&args2[1]);   /* drain 持份（一次性对象） */
             }
@@ -1591,7 +1898,216 @@ static void teb_drain_once(VM *vm) {
     bool stop_now = g_teb.pending_stop;
     g_teb.pending_stop = false;
     uv_mutex_unlock(&g_teb.mu);
-    if (stop_now && g_teb.ctx) teb_real_stop();
+    if (stop_now && g_teb.ctx) {
+        /* 主线程批末 → 直接真停（既有语义）；池线程批末 → 只置信号，
+         * 由主线程 run/drain 轮询执行真停（real_stop 会 join 池线程，
+         * 在池线程内执行会自 join 死锁）。 */
+        uv_thread_t self = uv_thread_self();
+        if (uv_thread_equal(&self, &g_teb.main_tid)) {
+            teb_real_stop();
+        } else {
+            teb_lock();
+            g_teb.stop_requested = true;
+            uv_cond_broadcast(&g_teb.cv);
+            uv_mutex_unlock(&g_teb.mu);
+        }
+    }
+}
+
+/* 主线程消费者：全部节点（run/drain/无池模式同路径） */
+static void teb_drain_once(VM *vm) { teb_drain_mode(vm, 0); }
+
+/* ---- 执行池（批3）：N 个独立 runtime 线程作为额外消费者 ----
+ * 泵 = 泵 PHP：`while (\Tphp\Teb\Internal\pump()) {}`（pump Program），
+ * 每轮 pump 调 drain 同款取批+处理（复用 teb_drain_once：mu 保护的取队
+ * 对多消费者天然安全；空队 10ms 节拍，无忙等）。stop 信号链：池回调
+ * stop() → stop_requested（批2）→ 主线程 run/drain poll → real_stop
+ * （shutdown → join 池 → mg_stop → 释放配置，顺序见 teb_real_stop）。 */
+
+/* 用户常量快照导入（池首泵一次；vm->consts 直写 = op_define_const 同款，
+ * 去重靠 tstr_eq——seed 常量已由 vm_seed_consts 预置，重名跳过值也跳过） */
+static void teb_import_consts(VM *vm) {
+    if (g_consts_imported) return;
+    g_consts_imported = true;
+    const char *d = g_teb.const_blob;
+    size_t n = g_teb.const_blob_len, pos = 0;
+    if (!d || n < 4) return;
+    uint32_t cnt;
+    memcpy(&cnt, d, 4);
+    pos = 4;
+    for (uint32_t i = 0; i < cnt; i++) {
+        if (pos + 4 > n) return;
+        uint32_t nl;
+        memcpy(&nl, d + pos, 4); pos += 4;
+        if (pos + nl + 4 > n) return;
+        TStr *nm = tstr_intern(d + pos, nl);
+        pos += nl;
+        uint32_t vl;
+        memcpy(&vl, d + pos, 4); pos += 4;
+        if (pos + vl > n) return;
+        bool dup = false;
+        for (int j = 0; j < vm->n_consts && !dup; j++)
+            dup = tstr_eq(vm->consts[j].name, nm);
+        if (!dup && vm->n_consts < 256) {
+            TVal v = TV_NULL;
+            if (tphp_unserialize_val(NULL, d + pos, vl, &v)) {
+                vm->consts[vm->n_consts].name = nm;
+                vm->consts[vm->n_consts].v = v;   /* 转移 unserialize +1 */
+                vm->n_consts++;
+            }
+        }
+        pos += vl;
+    }
+}
+
+/* \Tphp\Teb\Internal\pump(): bool —— 池泵体。shutdown/ctx 失效 → false
+ * （pump 循环退出 → run_closure 返回 → 线程收尾）。
+ * 泵只消费 HTTP 节点（teb_drain_mode mode=1）：WS 回调固定主线程。 */
+static TVal nm_pool_pump(VM *vm, void *self, TVal *args, int n) {
+    (void)self; (void)args; (void)n;
+    if (!g_teb.ctx || g_teb.shutdown) return TV_FALSE;
+    teb_import_consts(vm);
+    teb_drain_mode(vm, 1);
+    return TV_TRUE;
+}
+
+/* pump 主闭包（worker_unserialize_closure 同款手工构造；fn = prog->main，
+ * 零捕获；gc_register 后由 GC 回收，不显式释放——对齐 worker 先例） */
+static TClosure *teb_make_main_clo(Program *p) {
+    TClosure *clo = tm_malloc(sizeof *clo);
+    memset(clo, 0, sizeof *clo);
+    clo->h.rc = 1;
+    clo->h.kind = GC_KIND_CLO;
+    gc_register(&clo->h);
+    clo->fn = p->main;
+    clo->bfn = NULL;
+    clo->n_cap = 0;
+    clo->captures = NULL;
+    clo->scope = NULL;
+    return clo;
+}
+
+/* 池线程主体（worker.c L373-416 bootstrap 对照；无 mailbox 需求） */
+static void teb_pool_thread(void *arg) {
+    (void)arg;
+    tphp_worker_init();          /* 线程内部类（先于 clone，worker 同序） */
+    tphp_async_init();
+    tphp_io_init();
+    tphp_closure_class_init();
+    tphp_class_tab_clone_thread();   /* master → 本线程（teb 7 类随之克隆） */
+    tphp_sched_loop_init();
+
+    /* TLS 类句柄重取：克隆体指针 ≠ master，不重取则 cls==g_resp_cls 判定
+     * 全错。此时 tphp_vm_current 尚空 → class_resolve_lc 不触发 autoload。 */
+    g_web_cls = class_resolve_lc("tphp\\teb\\web");
+    g_req_cls = class_resolve_lc("tphp\\teb\\request");
+    g_resp_cls = class_resolve_lc("tphp\\teb\\response");
+    g_stream_cls = class_resolve_lc("tphp\\teb\\stream");
+    g_upfile_cls = class_resolve_lc("tphp\\teb\\uploadedfile");
+    g_ws_cls = class_resolve_lc("tphp\\teb\\websocket");
+    g_sess_cls = class_resolve_lc("tphp\\teb\\session");
+    if (!g_web_cls || !g_req_cls || !g_resp_cls || !g_stream_cls ||
+        !g_upfile_cls || !g_ws_cls || !g_sess_cls) {
+        tphp_warn("PHP Warning: Teb pool thread failed to resolve teb classes\n");
+        return;
+    }
+    g_in_pool_thread = true;
+
+    TClosure *clo = teb_make_main_clo(g_pump_prog);
+    TVal ret = TV_NULL;
+    tphp_vm_run_closure(g_pump_prog, g_teb.share, g_teb.n_share, clo, &ret);
+    tval_release(&ret);
+    teb_local_cache_free();      /* 捕获对象必须在本线程释放（F1 规则） */
+}
+
+/* 泵 Program（一次编译，进程级只读；源码恒定故永不失败——防御 warn 兜底） */
+static Program *teb_pump_program(void) {
+    if (!g_pump_prog) {
+        static const char SRC[] =
+            "<?php while (\\Tphp\\Teb\\Internal::pump()) {}";
+        AStmtList *ast = tphp_parse_script(SRC, "teb-pump.php");
+        if (!ast) {
+            tphp_warn("PHP Warning: Teb pump program parse failed\n");
+            return NULL;
+        }
+        g_pump_prog = tphp_compile(ast, "teb-pump.php");
+        if (g_pump_prog) tphp_prog_freeze(g_pump_prog);
+    }
+    return g_pump_prog;
+}
+
+/* start 收尾处调用（mg_start 后、返回前）：创建池线程 */
+static void teb_spawn_pools(void) {
+    int want = (int)g_teb.callback_threads;
+    if (want <= 0) return;
+    if (want > 16) want = 16;
+    if (!teb_pump_program()) {
+        g_teb.pools_armed = false;
+        return;
+    }
+    g_teb.pool_n = 0;
+    for (int i = 0; i < want; i++) {
+        if (uv_thread_create(&g_teb.pool_tids[i], teb_pool_thread, NULL) != 0)
+            break;
+        g_teb.pool_n++;
+    }
+    if (g_teb.pool_n < want)
+        tphp_warn("PHP Warning: Teb started %d/%d callback threads\n",
+                  g_teb.pool_n, want);
+    if (g_teb.pool_n == 0) g_teb.pools_armed = false;   /* 全失败 → 主线程独跑 */
+}
+
+/* 用户常量快照（start 主线程构建）：u32 cnt + cnt×{u32 nl, name, u32 vl,
+ * serialize(val)}。名字按字节存（池内重 intern），值走通用 serialize。 */
+static char *teb_const_snapshot(uint32_t *out_len) {
+    *out_len = 0;
+    VM *mvm = (VM *)tphp_vm_current;
+    if (!mvm) return NULL;
+    uint32_t cnt = 0;
+    for (int i = 0; i < mvm->n_consts; i++)
+        if (mvm->consts[i].name) cnt++;
+    if (!cnt) return NULL;
+    size_t cap = 4096, len = 4;
+    char *b = tm_malloc(cap);
+    memcpy(b, &cnt, 4);
+    for (int i = 0; i < mvm->n_consts; i++) {
+        TStr *nm = mvm->consts[i].name;
+        if (!nm) continue;
+        TStr *vs = tphp_serialize_val(mvm, mvm->consts[i].v);
+        if (!vs) continue;
+        size_t need = 4 + nm->len + 4 + vs->len;
+        while (len + need > cap) {
+            cap *= 2;
+            b = tm_realloc(b, cap);
+        }
+        uint32_t nl = nm->len, vl = vs->len;
+        memcpy(b + len, &nl, 4); len += 4;
+        memcpy(b + len, tstr_val(nm), nl); len += nl;
+        memcpy(b + len, &vl, 4); len += 4;
+        memcpy(b + len, tstr_val(vs), vl); len += vl;
+        tval_release(&(TVal){ .t = T_STR, .u.p = vs });
+    }
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+/* start 时回填既有配置 blob（start 前注册是常态；与运行期发布点共用
+ * teb_snapshot_cb）。start 单线程（未 draining）→ 免锁遍历安全。 */
+static void teb_backfill_blobs(void) {
+    for (TebRoute *r = g_teb.routes; r; r = r->next)
+        teb_snapshot_cb(r->callable, &r->cb_blob, &r->cb_blob_len);
+    for (TebRoute *b = g_teb.befores; b; b = b->next)
+        teb_snapshot_cb(b->callable, &b->cb_blob, &b->cb_blob_len);
+    if (g_teb.nf)
+        teb_snapshot_cb(g_teb.nf->callable, &g_teb.nf->cb_blob,
+                        &g_teb.nf->cb_blob_len);
+    for (TebWsReg *rg = g_teb.ws_regs; rg; rg = rg->next) {
+        teb_snapshot_cb(rg->on_open, &rg->cb_blob[0], &rg->cb_blob_len[0]);
+        if (rg->on_msg.t != T_NULL)
+            teb_snapshot_cb(rg->on_msg, &rg->cb_blob[1], &rg->cb_blob_len[1]);
+        if (rg->on_close.t != T_NULL)
+            teb_snapshot_cb(rg->on_close, &rg->cb_blob[2], &rg->cb_blob_len[2]);
+    }
 }
 
 /* ---- Tphp\Teb\Web 原生方法 ---- */
@@ -1615,13 +2131,22 @@ static TVal nm_web_route(VM *vm, void *self, TVal *args, int n) {
     r->uri = teb_dup(uri);
     r->callable = cb;
     tval_addref(cb);
+    r->cb_blob = NULL;
+    r->cb_blob_len = 0;
+    if (g_teb.pools_armed)   /* 池启用：发布点快照（可能 raise——须在锁外） */
+        teb_snapshot_cb(cb, &r->cb_blob, &r->cb_blob_len);
+    teb_lock();                 /* 发布：thunk 匹配在 worker 线程读链表 */
     r->next = g_teb.routes;
     g_teb.routes = r;
+    g_teb.config_gen++;
+    uv_mutex_unlock(&g_teb.mu);
     tval_addref(TV_OBJ((TObj *)self));
     return TV_OBJ((TObj *)self);
 }
 
-/* notFound(callable $cb): self —— 无路由命中时的回调；单条，重复调用替换 */
+/* notFound(callable $cb): self —— 无路由命中时的回调；单条，重复调用替换。
+ * 替换走「新节点 + 退休链」：thunk 可能正持有旧节点指针，就地改写 callable
+ * 会撕引用计数——旧节点留到 stop 统一释放。 */
 static TVal nm_web_not_found(VM *vm, void *self, TVal *args, int n) {
     (void)self;
     if (n < 1)
@@ -1634,18 +2159,23 @@ static TVal nm_web_not_found(VM *vm, void *self, TVal *args, int n) {
         tphp_vm_raise(vm, "TypeError",
                       "Web::notFound(): callable expected as argument 1");
     }
+    TebRoute *r = tm_malloc(sizeof *r);
+    r->uri = NULL;
+    r->callable = cb;
+    tval_addref(cb);
+    r->next = NULL;
+    r->cb_blob = NULL;
+    r->cb_blob_len = 0;
+    if (g_teb.pools_armed)
+        teb_snapshot_cb(cb, &r->cb_blob, &r->cb_blob_len);
+    teb_lock();
     if (g_teb.nf) {
-        tval_release(&g_teb.nf->callable);
-        g_teb.nf->callable = cb;
-        tval_addref(cb);
-    } else {
-        TebRoute *r = tm_malloc(sizeof *r);
-        r->uri = NULL;
-        r->callable = cb;
-        tval_addref(cb);
-        r->next = NULL;
-        g_teb.nf = r;
+        g_teb.nf->next = g_teb.nf_retired;
+        g_teb.nf_retired = g_teb.nf;
     }
+    g_teb.nf = r;
+    g_teb.config_gen++;
+    uv_mutex_unlock(&g_teb.mu);
     tval_addref(TV_OBJ((TObj *)self));
     return TV_OBJ((TObj *)self);
 }
@@ -1668,7 +2198,15 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     g_teb.shutdown = false;
     g_teb.draining = false;
     g_teb.pending_stop = false;
+    g_teb.stop_requested = false;
     uv_mutex_unlock(&g_teb.mu);
+
+    /* 辅助锁 + 主线程 id + 全局计数：mg_start 建线程前完成（批2 并发加固） */
+    teb_aux_locks_init();
+    g_teb.main_tid = uv_thread_self();
+    g_teb.up_seq = 0;
+    g_teb.config_gen = 0;
+    g_teb.pool_n = 0;
 
     /* P1-1 stats 复位（started_at = 本次启动时刻） */
     memset(&g_teb.st, 0, sizeof g_teb.st);
@@ -1706,8 +2244,8 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     g_teb.session_last_gc = 0;                 /* 每次 start 后允许立即 GC */
 
     /* assoc 数组展平成 key1,val1,...,NULL 的 const char**；
-     * upload_tmp_dir/upload_max_bytes 为 teb 自留键——识别后摘除不透传
-     * （透传 civetweb 会 unknown option 启动失败） */
+     * upload_* 、session_* 、callback_threads 为 teb 自留键——识别后摘除
+     * 不透传（透传 civetweb 会 unknown option 启动失败） */
     TArr *arr = (TArr *)args[0].u.p;
     tarr_sync_buckets(arr);
     int64_t n_buckets = arr->bcap;
@@ -1715,6 +2253,7 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     const char **opts = tm_malloc(sizeof(char *) * (size_t)(n_buckets * 2 + 4));
     int k = 0;
     bool has_keep_alive = false;
+    bool has_cb_threads = false;
     for (int64_t bi = 0; bi < n_buckets; bi++) {
         ABucket *bk = &arr->buckets[bi];
         if (bk->key.t == T_NULL) continue;
@@ -1726,6 +2265,18 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
         TVal val = arr->data[bk->val_off];
 
         if (strcmp(kc, "enable_keep_alive") == 0) has_keep_alive = true;
+        if (strcmp(kc, "callback_threads") == 0) {
+            /* 执行池线程数（自留键）：缺省 min(4, CPU核数)；0 = 关池逃生舱 */
+            has_cb_threads = true;
+            TStr *vs;
+            TVal tmp = TV_NULL;
+            if (val.t == T_STR) vs = (TStr *)val.u.p;
+            else { vs = tval_to_str(val); tmp = TV_STR(vs); }
+            int64_t nt = strtoll(tstr_val(vs), NULL, 10);
+            g_teb.callback_threads = nt < 0 ? 0 : (nt > 16 ? 16 : nt);
+            tval_release(&tmp);
+            continue;
+        }
 
         if (strcmp(kc, "upload_tmp_dir") == 0) {
             TStr *vs;
@@ -1794,6 +2345,37 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     }
     opts[k] = NULL;
 
+    /* 执行池准备（mg_start 前：NotCloneable 等 raise 在服务未起时干净中止）：
+     * callback_threads 缺省 min(4,核数) → 字节码共享表 + 用户常量快照 +
+     * 既有配置 blob 回填 → pools_armed。失败路径保持 pools_armed=false。 */
+    if (!has_cb_threads) {
+        int ncpu = 0;
+        uv_cpu_info_t *ci = NULL;
+        if (uv_cpu_info(&ci, &ncpu) == 0 && ncpu > 0) uv_free_cpu_info(ci, ncpu);
+        int def = (ncpu > 0 && ncpu < 4) ? ncpu : 4;
+        g_teb.callback_threads = def < 1 ? 1 : def;
+    }
+    g_teb.pools_armed = false;
+    if (g_teb.callback_threads > 0) {
+        VM *mvm = (VM *)tphp_vm_current;
+        if (mvm && mvm->prog) {
+            int cap = 1 + mvm->n_inc_progs;
+            g_teb.share = tm_malloc(sizeof(Program *) * (size_t)cap);
+            g_teb.n_share = 0;
+            g_teb.share[g_teb.n_share++] = mvm->prog;
+            for (int i = 0; i < mvm->n_inc_progs; i++) {
+                if (mvm->inc_progs[i] && mvm->inc_progs[i] != mvm->prog)
+                    g_teb.share[g_teb.n_share++] = mvm->inc_progs[i];
+            }
+            g_teb.const_blob = teb_const_snapshot(&g_teb.const_blob_len);
+            /* 既有配置回填（start 前注册的路由/before/nf/ws） */
+            teb_backfill_blobs();
+            g_teb.pools_armed = true;
+        } else {
+            g_teb.callback_threads = 0;
+        }
+    }
+
     g_teb.ctx = mg_start(NULL, NULL, opts);
 
     for (int i = 0; i < k; i += 2) tm_free((void *)opts[i]);
@@ -1810,6 +2392,8 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
         mg_set_websocket_handler(g_teb.ctx, rg->uri, ws_connect_ok,
                                  ws_ready_cb, ws_data_cb, ws_close_cb, rg);
     }
+
+    teb_spawn_pools();   /* 执行池：handler 挂妥后创建（批3） */
 
     o->props[0] = TV_INT((int64_t)(uintptr_t)g_teb.ctx);
     /* 登记运行中实例（real_stop 释放引用并清 props[0]）。
@@ -1829,22 +2413,36 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
 static TVal nm_web_drain(VM *vm, void *self, TVal *args, int n) {
     (void)self; (void)args; (void)n;
     if (g_teb.ctx) teb_drain_once(vm);
+    teb_poll_stop_request();
     return TV_NULL;
 }
 
 /* run(): void —— 阻塞主循环；stop() 或析构置 ctx=0 时退出 */
 static TVal nm_web_run(VM *vm, void *self, TVal *args, int n) {
     (void)self; (void)args; (void)n;
-    while (g_teb.ctx) teb_drain_once(vm);
+    while (g_teb.ctx) {
+        teb_drain_once(vm);
+        teb_poll_stop_request();   /* 非主线程 stop() → 本线程执行真停 */
+    }
     return TV_NULL;
 }
 
 /* stop(): void —— 幂等；draining 中只挂 pending_stop（回调内 stop 合法），
- * 批末由 drain 执行 teb_real_stop（doc/API.md Web::stop） */
+ * 批末由 drain 执行 teb_real_stop（doc/API.md Web::stop）。
+ * 非主线程（执行池回调）调用：只置 stop_requested + 唤醒，由主线程
+ * run/drain 轮询后执行真停（join 自己会死锁，故只发信号）。 */
 static TVal nm_web_stop(VM *vm, void *self, TVal *args, int n) {
     (void)args; (void)n;
     TObj *o = (TObj *)self;
     if (!g_teb.ctx) return TV_NULL;
+    uv_thread_t self_tid = uv_thread_self();
+    if (!uv_thread_equal(&self_tid, &g_teb.main_tid)) {
+        teb_lock();
+        g_teb.stop_requested = true;
+        uv_cond_broadcast(&g_teb.cv);
+        uv_mutex_unlock(&g_teb.mu);
+        return TV_NULL;
+    }
     if (g_teb.draining) {
         g_teb.pending_stop = true;
         return TV_NULL;
@@ -1876,6 +2474,11 @@ static TVal nm_web_before(VM *vm, void *self, TVal *args, int n) {
     b->callable = cb;
     tval_addref(cb);
     b->next = NULL;
+    b->cb_blob = NULL;
+    b->cb_blob_len = 0;
+    if (g_teb.pools_armed)
+        teb_snapshot_cb(cb, &b->cb_blob, &b->cb_blob_len);
+    teb_lock();
     /* 尾插：按注册序执行 */
     if (!g_teb.befores) {
         g_teb.befores = b;
@@ -1884,8 +2487,26 @@ static TVal nm_web_before(VM *vm, void *self, TVal *args, int n) {
         while (t->next) t = t->next;
         t->next = b;
     }
+    g_teb.config_gen++;
+    uv_mutex_unlock(&g_teb.mu);
     tval_addref(TV_OBJ((TObj *)self));
     return TV_OBJ((TObj *)self);
+}
+
+/* __clonestate(): array —— 跨线程克隆协议：路由闭包 use($web) 捕获时经
+ * serialize 进池线程，携带 ctx 句柄；恢复侧缺省按名回填 props，stop() 的
+ * ctx 身份判定照常成立。无 ctx（未 start）→ 空状态。 */
+static TVal nm_web_clonestate(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    TArr *a = tarr_new();
+    if (o->props[0].t == T_INT) {
+        TVal k = TV_STR(tstr_intern("ctx", 3));
+        TVal v = TV_INT(o->props[0].u.i);
+        tarr_set(a, k, v);
+        tval_release(&k);
+    }
+    return TV_ARR(a);
 }
 
 /* P1-1 stats(): array —— 运行统计；任意时刻可调（未启动全 0）。
@@ -1939,8 +2560,11 @@ static TVal nm_web_file(VM *vm, void *self, TVal *args, int n) {
     TebStatic *ts = tm_malloc(sizeof *ts);
     ts->prefix = teb_dup(prefix);
     ts->dir = teb_dup(dir);
-    ts->next = g_teb.statics;   /* 头插：thunk 只读指针，注册即挂 */
+    teb_lock();
+    ts->next = g_teb.statics;   /* 头插：thunk 匹配读链表须同锁 */
     g_teb.statics = ts;
+    g_teb.config_gen++;
+    uv_mutex_unlock(&g_teb.mu);
     tval_addref(TV_OBJ((TObj *)self));
     return TV_OBJ((TObj *)self);
 }
@@ -1977,10 +2601,23 @@ static TVal nm_web_websocket(VM *vm, void *self, TVal *args, int n) {
     if (rg->on_msg.t != T_NULL) tval_addref(rg->on_msg);
     rg->on_close = (n >= 4 && args[3].t != T_NULL) ? args[3] : TV_NULL;
     if (rg->on_close.t != T_NULL) tval_addref(rg->on_close);
+    memset(rg->cb_blob, 0, sizeof rg->cb_blob);
+    memset(rg->cb_blob_len, 0, sizeof rg->cb_blob_len);
+    if (g_teb.pools_armed) {   /* 三回调各自快照（可能 raise——锁外） */
+        teb_snapshot_cb(rg->on_open, &rg->cb_blob[0], &rg->cb_blob_len[0]);
+        if (rg->on_msg.t != T_NULL)
+            teb_snapshot_cb(rg->on_msg, &rg->cb_blob[1], &rg->cb_blob_len[1]);
+        if (rg->on_close.t != T_NULL)
+            teb_snapshot_cb(rg->on_close, &rg->cb_blob[2], &rg->cb_blob_len[2]);
+    }
+    teb_lock();
     rg->next = g_teb.ws_regs;
     g_teb.ws_regs = rg;
+    g_teb.config_gen++;
+    bool running = (g_teb.ctx != NULL);
+    uv_mutex_unlock(&g_teb.mu);
     /* 运行中注册：立即挂（start 前注册者由 start 批量挂） */
-    if (g_teb.ctx) {
+    if (running) {
         mg_set_websocket_handler(g_teb.ctx, rg->uri, ws_connect_ok,
                                  ws_ready_cb, ws_data_cb, ws_close_cb, rg);
     }
@@ -2866,10 +3503,14 @@ static bool teb_sess_write(const char *path, const char *d, size_t n) {
  * 惰性单文件过期由 teb_session_open 的 mtime 检查负责，本函数只是回收。 */
 static void teb_sess_gc(void) {
     int64_t now = (int64_t)time(NULL);
+    teb_lock();                     /* 节流状态与注册/stats 同锁 */
     if (g_teb.session_last_gc != 0 &&
-        now - g_teb.session_last_gc < g_teb.session_gc_interval)
+        now - g_teb.session_last_gc < g_teb.session_gc_interval) {
+        uv_mutex_unlock(&g_teb.mu);
         return;
+    }
     g_teb.session_last_gc = now;
+    uv_mutex_unlock(&g_teb.mu);
     uv_fs_t req;
     if (uv_fs_scandir(NULL, &req, g_teb.session_save_path, 0, NULL) < 0) {
         uv_fs_req_cleanup(&req);
@@ -2914,35 +3555,45 @@ static char *teb_sess_cookie_line(TObj *sess) {
     return teb_dup(buf);
 }
 
-/* 响应写出后统一落盘（drain 挂点调用）：滑动续期 = 每次打开都重写
- * （mtime 刷新与 Set-Cookie 滑动配对）。严禁 raise/调 VM——此时响应已发出。 */
+/* 响应写出后统一落盘（消费者挂点调用）：滑动续期 = 每次打开都重写
+ * （mtime 刷新与 Set-Cookie 滑动配对）。严禁 raise/调 VM——此时响应已发出。
+ * 末尾统一释放 per-sid 条带锁（props[3]/props[4] 记录加锁时的 sid——
+ * 会话中途 regenerateId()/destroy+set() 会换 id，解锁必须用原加锁 sid）。 */
 static void teb_session_flush(TObj *req) {
     TObj *sess = teb_sess_of(req);
     if (!sess) return;
-    if (sess->props[2].t == T_TRUE) return;      /* destroyed：文件已删 */
-    if (sess->props[1].t != T_ARR) return;
-    TStr *id = (sess->props[0].t == T_STR) ? (TStr *)sess->props[0].u.p : NULL;
-    if (!id) return;
-    TStr *enc = NULL;
-    if (!tphp_json_encode_c(sess->props[1], &enc) || !enc) {
-        tphp_warn("PHP Warning: Teb session data is not JSON-encodable; "
-                  "session not persisted for this request\n");
-        return;
+    if (sess->props[2].t != T_TRUE && sess->props[1].t == T_ARR) {
+        TStr *id = (sess->props[0].t == T_STR) ? (TStr *)sess->props[0].u.p : NULL;
+        if (id) {
+            TStr *enc = NULL;
+            if (!tphp_json_encode_c(sess->props[1], &enc) || !enc) {
+                tphp_warn("PHP Warning: Teb session data is not JSON-encodable; "
+                          "session not persisted for this request\n");
+            } else {
+                char path[TEB_SESS_PATH_CAP];
+                if (!teb_sess_path(path, sizeof path, tstr_val(id))) {
+                    tphp_warn("PHP Warning: Teb session_save_path too long; "
+                              "session not persisted\n");
+                } else if (!teb_sess_write(path, tstr_val(enc), enc->len)) {
+                    tphp_warn("PHP Warning: Teb session write failed (%s)\n", path);
+                }
+                tval_release(&(TVal){ .t = T_STR, .u.p = enc });
+            }
+        }
     }
-    char path[TEB_SESS_PATH_CAP];
-    if (!teb_sess_path(path, sizeof path, tstr_val(id))) {
-        tval_release(&(TVal){ .t = T_STR, .u.p = enc });
-        tphp_warn("PHP Warning: Teb session_save_path too long; "
-                  "session not persisted\n");
-        return;
+    if (sess->props[3].t == T_TRUE &&
+        sess->props[4].t == T_STR) {
+        TStr *lk = (TStr *)sess->props[4].u.p;
+        teb_sess_unlock(tstr_val(lk), lk->len);
+        teb_set_slot(sess, 4, TV_NULL);
+        sess->props[3] = TV_FALSE;
     }
-    if (!teb_sess_write(path, tstr_val(enc), enc->len))
-        tphp_warn("PHP Warning: Teb session write failed (%s)\n", path);
-    tval_release(&(TVal){ .t = T_STR, .u.p = enc });
 }
 
 /* 惰性打开会话（$r->session()；同请求幂等）。读入站 cookie → 校验 →
- * mtime 过期判定（惰性单文件过期）→ 读文件 JSON 解码 → GC → 建对象。 */
+ * per-sid 条带锁 → mtime 过期判定（惰性单文件过期）→ 读文件 JSON 解码 →
+ * GC → 建对象。加锁顺序：全部 raise 点（目录/路径/CSPRNG）在加锁前完成，
+ * 锁一旦持有直到 flush 释放（早释放 = 丢更新窗口）。 */
 static TObj *teb_session_open(VM *vm, TObj *req) {
     if (req->props[8].t == T_OBJ) {
         tval_addref(req->props[8]);
@@ -2974,21 +3625,23 @@ static TObj *teb_session_open(VM *vm, TObj *req) {
         }
     }
 
-    /* 读会话数据：sid 合法 → mtime 过期则作废换新；未过期读文件解码。
-     * 读失败/解码失败保留 sid 空数据（自愈，避免 cookie 抖动）。 */
+    /* 路径构造（raise 点，锁前完成） */
+    char path[TEB_SESS_PATH_CAP] = {0};
+    if (have_sid && !teb_sess_path(path, sizeof path, sid))
+        tphp_vm_raise(vm, "Error",
+                      "Tphp\\Teb\\Request::session(): session_save_path"
+                      " too long");
+
+    /* 读会话数据（持锁读，防与并发 flush 撕更新）：mtime 过期则解锁作废
+     * 换新；读失败/解码失败保留 sid 空数据（自愈，避免 cookie 抖动）。 */
     TArr *data = tarr_new();
     if (have_sid) {
-        char path[TEB_SESS_PATH_CAP];
-        if (!teb_sess_path(path, sizeof path, sid)) {
-            tval_release(&(TVal){ .t = T_ARR, .u.p = data });
-            tphp_vm_raise(vm, "Error",
-                          "Tphp\\Teb\\Request::session(): session_save_path"
-                          " too long");
-        }
+        teb_sess_lock(sid, TEB_SESS_SID_LEN);
         int64_t mt = teb_fs_mtime(path);
         if (mt >= 0 && (int64_t)time(NULL) - mt > g_teb.session_lifetime) {
             teb_fs_unlink(path);
-            have_sid = false;              /* 过期 → 全新会话 */
+            teb_sess_unlock(sid, TEB_SESS_SID_LEN);   /* 过期作废 → 走下方换新 */
+            have_sid = false;
         } else if (mt >= 0) {
             char *raw = NULL; size_t rlen = 0;
             if (teb_read_file_max(path, TEB_SESS_MAX_BYTES, &raw, &rlen) == 0) {
@@ -3001,26 +3654,33 @@ static TObj *teb_session_open(VM *vm, TObj *req) {
                 tm_free(raw);
             }
         }
+        /* mt<0（文件不存在）：持锁继续，flush 写出新文件 */
     }
-    if (!have_sid && !teb_sid_random(sid)) {
-        tval_release(&(TVal){ .t = T_ARR, .u.p = data });
-        tphp_vm_raise(vm, "Error",
-                      "Tphp\\Teb\\Request::session(): CSPRNG unavailable"
-                      " (uv_random failed)");
+    if (!have_sid) {
+        if (!teb_sid_random(sid)) {                 /* raise 点：此时无锁 */
+            tval_release(&(TVal){ .t = T_ARR, .u.p = data });
+            tphp_vm_raise(vm, "Error",
+                          "Tphp\\Teb\\Request::session(): CSPRNG unavailable"
+                          " (uv_random failed)");
+        }
+        teb_sess_lock(sid, TEB_SESS_SID_LEN);
     }
 
-    teb_sess_gc();                          /* 节流门内，非每请求全扫 */
+    teb_sess_gc();                          /* 节流门内，非每请求全扫（内部 mu） */
 
     TObj *s = tphp_obj_alloc(g_sess_cls);
     s->props[0] = TV_STR(tstr_new(sid, TEB_SESS_SID_LEN));
     s->props[1] = TV_ARR(data);
     s->props[2] = TV_FALSE;
+    s->props[3] = TV_TRUE;                  /* lock_held：flush 释放 */
+    s->props[4] = TV_STR(tstr_new(sid, TEB_SESS_SID_LEN));   /* lock_sid 原件 */
 
     teb_set_slot(req, 8, TV_OBJ(s));        /* Request 持 +1（转移） */
     tval_addref(TV_OBJ(s));                 /* 返回 +1 */
     /* 正向同步：Stream 已在（先 beginStream 后 session）→ 挂 Stream 槽 */
     TVal st = req->props[4];
-    if (st.t == T_OBJ && ((TObj *)st.u.p)->cls == g_stream_cls) {
+    if (st.t == T_OBJ && teb_is_cls((TObj *)st.u.p, g_stream_cls,
+                                    "Tphp\\Teb\\Stream")) {
         TObj *so = (TObj *)st.u.p;
         so->props[5] = TV_OBJ(s);
         tval_addref(so->props[5]);
@@ -3411,7 +4071,9 @@ static TVal nm_ws_close(VM *vm, void *self, TVal *args, int n) {
     mg_websocket_write(conn, MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE,
                        cs ? cs->c : "", cs ? cs->len : 0);
     mg_unlock_connection(conn);
-    o->props[1] = TV_TRUE;   /* close_requested → data 回调返回 0 */
+    teb_lock();               /* props[1] 与 data 回调线程的读同锁 */
+    o->props[1] = TV_TRUE;    /* close_requested → data 回调返回 0 */
+    uv_mutex_unlock(&g_teb.mu);
     return TV_NULL;
 }
 
@@ -3441,6 +4103,7 @@ static void teb_register_classes(void) {
     teb_cls_add_native(w, "drain", (void *)nm_web_drain, false);
     teb_cls_add_native(w, "run", (void *)nm_web_run, false);
     teb_cls_add_native(w, "stop", (void *)nm_web_stop, false);
+    teb_cls_add_native(w, "__cloneState", (void *)nm_web_clonestate, false);
     tphp_class_register_compile(w);
     g_web_cls = w;
 
@@ -3552,11 +4215,14 @@ static void teb_register_classes(void) {
     tphp_class_register_compile(ws);
     g_ws_cls = ws;
 
-    /* Session：props 0=id 1=data 2=destroyed（不可手动 new，见 nm_sess_construct） */
+    /* Session：props 0=id 1=data 2=destroyed 3=lock_held 4=lock_sid
+     *（3/4 为 per-sid 条带锁内部槽，私有不可见；禁手动 new，见 nm_sess_construct） */
     TClass *ss = teb_cls_new("Tphp\\Teb\\Session");
     teb_cls_add_prop(ss, "id");
     teb_cls_add_prop(ss, "data");
     teb_cls_add_prop(ss, "destroyed");
+    teb_cls_add_prop(ss, "lock_held");
+    teb_cls_add_prop(ss, "lock_sid");
     teb_cls_add_ctor(ss, (void *)nm_sess_construct);
     teb_cls_add_native(ss, "id", (void *)nm_sess_id, false);
     teb_cls_add_native(ss, "get", (void *)nm_sess_get, false);
@@ -3568,6 +4234,12 @@ static void teb_register_classes(void) {
     teb_cls_add_native(ss, "regenerateId", (void *)nm_sess_regenerate, false);
     tphp_class_register_compile(ss);
     g_sess_cls = ss;
+
+    /* Internal：泵类（pump Program 的 `while(\\Tphp\\Teb\\Internal\\pump())`
+     * 调用目标；native static，self=NULL。仅此一个方法，无 ctor/props） */
+    TClass *it = teb_cls_new("Tphp\\Teb\\Internal");
+    teb_cls_add_native(it, "pump", (void *)nm_pool_pump, true);
+    tphp_class_register_compile(it);
 }
 
 /* ---- init：被 ext registry 调用，首脚本编译前一次 ---- */

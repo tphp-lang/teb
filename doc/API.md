@@ -16,7 +16,7 @@
 | `websocket` | `string` `$uri` 路径 <br> `callable` `$onOpen` `function (WebSocket $s, Request $r)` <br> `?callable` `$onMessage` = null `function (WebSocket $s, string $data, int $bits)` <br> `?callable` `$onClose` = null `function (WebSocket $s)` | self | 注册 WebSocket；`$bits` 为消息 opcode（1=文本 2=二进制）；onMessage 异常 → 关连接，onOpen/onClose 异常忽略；客户端 PING/PONG/CLOSE 帧不进 onMessage |
 | `start` | `array` `$options` 配置项（值全部为 string，整数需 `(string)` 转换） | self | 启动服务器（civetweb 配置直通）；未知键抛 `Error`；同一进程只允许一个 server；配置项见下方 |
 | `run` | - | - | 阻塞主循环（内部逐批处理请求）直到 `stop()` |
-| `drain` | - | - | 单次泵：处理当前挂起请求后返回；无请求阻塞至多 10ms（有请求立即唤醒）。自控事件循环时替代 `run()` |
+| `drain` | - | - | 单次泵（run 内部也用它）：处理当前挂起请求后返回；无请求阻塞至多 10ms（有请求立即唤醒）。自控事件循环时替代 `run()`。池线程是**额外**消费者（`callback_threads>0` 时 HTTP 请求可能由池处理，本调用只兜主线程份额；WS 请求恒由主线程处理） |
 | `stop` | - | - | 停止服务器、释放路由与 notFound；幂等；**回调内调用合法**（挂起至当前批处理完再真停）；重启后需重新 `route()`/`notFound()` |
 | `stats` | - | array | `started_at` / `uptime` / `requests_total`（**含入口 413 被拒请求**） / `requests_active` / `responses`（按状态码，键为十进制码字符串，如 `"413"`） / `bytes_sent` / `ws_active` / `ws_frames`（数据消息数，分片合并计 1，控制帧不计） / `ws_closed`；任意时刻可调，start 时复位 |
 
@@ -38,8 +38,18 @@
 | `session_save_path` | **teb 自留键**：会话文件目录（缺省系统临时目录下 `tphp_sess`；父目录须存在，目录缺失时自动创建） | `"/var/lib/tphp/sess"` |
 | `session_lifetime` | **teb 自留键**：会话空闲过期秒数（缺省 `1209600`，14 天）。cookie `Max-Age` 与服务端文件 TTL 同值 | `"86400"` |
 | `session_gc_interval` | **teb 自留键**：会话目录过期文件清扫的节流秒数（缺省 `300`） | `"60"` |
+| `callback_threads` | **teb 自留键**：HTTP 回调执行池线程数（缺省 `min(4, CPU核数)`）。`"0"` 关池（纯主线程串行，逃生舱）。每个池线程是独立 runtime（见「线程模型」节） | `"8"` |
+| `enable_keep_alive` | civetweb 键，**teb 缺省注入 `yes`**（显式传值优先）：HTTP/1.1 持久连接；一条持久连接占一个 worker 线程（空闲 `keep_alive_timeout_ms` 缺省 500ms 回收），`num_threads` 按峰值常连接数配置 | `"no"` |
 
-- 自留键（`upload_tmp_dir` / `upload_max_bytes` / `session_*`）被识别后摘除，不透传 civetweb；传入未知配置项会导致启动失败（抛 `Error`）。
+- 自留键（`upload_tmp_dir` / `upload_max_bytes` / `session_*` / `callback_threads`）被识别后摘除，不透传 civetweb；传入未知配置项会导致启动失败（抛 `Error`）。
+
+#### 线程模型（执行池）
+
+- **HTTP 回调缺省由执行池并行执行**：`callback_threads`（缺省 `min(4, CPU核数)`）个池线程各持独立 tphp runtime（类表/常量/globals/字符串 intern 全隔离），与主线程一起消费请求队列——单个慢回调不再阻塞全站；`callback_threads=0` 回到纯主线程串行（与旧版行为完全一致的逃生舱）。
+- **WS 回调固定主线程**：onOpen/onMessage/onClose 只在主线程执行——跨帧/跨连接的 `global` 状态（如聊天室房间表）与主脚本种子同线程。
+- **同请求内回调恒同线程**：before 链与路由回调在同一次分发里执行，`global` 在请求内传值不受池影响；跨**请求**的 globals/`define`/静态类属性按线程隔离（池线程看不到主脚本种子），跨请求共享状态请用 Session 或文件。
+- **回调闭包跨线程克隆**：池启用时所有路由/中间件/WS 回调在 `start()` 序列化快照（运行期新增的注册在发布时快照），捕获值必须可克隆（对象需 `__cloneState`；内置 `Web` 支持 `use ($web)`），否则 `start()` 抛 `NotCloneableError`。`Request`/`Response`/`Stream`/`Session`/`WebSocket` 对象不跨线程（生命周期恒在处理它的线程内）。
+- **stop 链**：池回调内 `$web->stop()` 只置信号，由主线程 `run()`/`drain()` 轮询后统一执行真停（shutdown → join 池 → 停服务器 → 释放配置）；主线程回调内 stop 语义与旧版相同（draining 中挂 pending_stop，批末真停）。
 
 ### `class` 类名 `Request`
 

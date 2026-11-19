@@ -60,6 +60,22 @@ if wait_ready "$BASE_R/ok" 15; then
     # 精确匹配
     check "route exact /" "hello world" "$(curlp "$BASE_R/")"
 
+    # ---- keep-alive（批1）：HTTP/1.1 缺省持久 + 同进程连接复用 + 1.0 降级 ----
+    if curl -s --noproxy '*' -m 5 -v -o /dev/null "$BASE_R/ok" "$BASE_R/ok" 2>&1 \
+        | grep -q "Re-using existing connection"; then
+        check "keep-alive: same-conn reuse" "reused" "reused"
+    else
+        check "keep-alive: same-conn reuse" "reused" "new-conn"
+    fi
+    if curl -s --noproxy '*' -m 5 -v -o /dev/null --http1.0 "$BASE_R/ok" "$BASE_R/ok" 2>&1 \
+        | grep -q "Re-using existing connection"; then
+        check "http/1.0 downgrade: no reuse" "no-reuse" "reused"
+    else
+        check "http/1.0 downgrade: no reuse" "no-reuse" "no-reuse"
+    fi
+    ckclose=$(curlp -i "$BASE_R/ok" | grep -ci "^Connection: close")
+    check "response omits Connection: close" "0" "$ckclose"
+
     # 前缀匹配 + remoteAddr
     body=$(curlp "$BASE_R/hello")
     case "$body" in
