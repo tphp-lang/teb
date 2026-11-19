@@ -512,6 +512,10 @@ static void teb_write_413(struct mg_connection *conn) {
     teb_lock();
     g_teb.st.requests_total++;   /* 被拒请求同样计数（与 drain 侧同锁） */
     uv_mutex_unlock(&g_teb.mu);
+    /* keep-alive 下必须显式关连接：handler 返 1 会触发 civetweb 的
+     * discard_unread_request_data，把超大 body 全量读完——413 提前拒绝
+     * 的意义尽失；置 must_close 后 discard 被跳过、连接直接关。 */
+    mg_disable_connection_keep_alive(conn);
     teb_wr(conn, TEB_413, sizeof TEB_413 - 1);
     teb_stat_resp(413);
 }
@@ -802,26 +806,43 @@ static void teb_write_response(struct mg_connection *conn, TObj *r, TObj *req) {
     }
 
     size_t blen = body ? body->len : 0;
-    ln = snprintf(line, sizeof line,
-                  "Content-Length: %zu\r\nConnection: close\r\n\r\n", blen);
+    /* keep-alive：HTTP/1.1 缺省即持久，不再手写 close（Stream/413 例外，
+     * 它们靠 close 定界/提前拒收，见各自注释）。HEAD 只发头不发 body——
+     * close 时代该问题被掩盖，keep-alive 下 body 字节会污染下一响应。 */
+    ln = snprintf(line, sizeof line, "Content-Length: %zu\r\n\r\n", blen);
     teb_wr(conn, line, (unsigned long long)ln);
-    if (body && blen) teb_wr(conn, body->c, (unsigned long long)blen);
+    bool is_head = false;
+    if (req) {
+        TVal mv = teb_info_get(req, "method");
+        is_head = (mv.t == T_STR &&
+                   strcmp(tstr_val((TStr *)mv.u.p), "HEAD") == 0);
+    }
+    if (body && blen && !is_head) teb_wr(conn, body->c, (unsigned long long)blen);
 }
 
-/* 回调异常 / 未返回 Response 的兜底。HEAD/TAIL 拆分供会话 cookie 注入，
- * 拼接后与拆分前逐字节相同（既有 500 断言不受影响）。 */
+/* 回调异常 / 未返回 Response 的兜底。HEAD/TAIL 拆分供会话 cookie 注入；
+ * keep-alive 下 TAIL 不带 close（有 Content-Length），body 独立常量供
+ * HEAD 守卫（同 teb_write_response）。 */
 static const char TEB_500_HEAD[] =
     "HTTP/1.1 500 Internal Server Error\r\n"
     "Content-Type: text/plain\r\n";
 static const char TEB_500_TAIL[] =
-    "Content-Length: 21\r\n"
-    "Connection: close\r\n\r\nInternal Server Error";
+    "Content-Length: 21\r\n\r\n";
+static const char TEB_500_BODY[] = "Internal Server Error";
 
 static void teb_write_500(struct mg_connection *conn, TObj *req) {
     teb_wr(conn, TEB_500_HEAD, sizeof TEB_500_HEAD - 1);
     char *cl = teb_sess_cookie_line(teb_sess_of(req));
     if (cl) { teb_wr(conn, cl, strlen(cl)); tm_free(cl); }
     teb_wr(conn, TEB_500_TAIL, sizeof TEB_500_TAIL - 1);
+    bool is_head = false;
+    if (req) {
+        TVal mv = teb_info_get(req, "method");
+        is_head = (mv.t == T_STR &&
+                   strcmp(tstr_val((TStr *)mv.u.p), "HEAD") == 0);
+    }
+    if (!is_head)
+        teb_wr(conn, TEB_500_BODY, sizeof TEB_500_BODY - 1);
     teb_stat_resp(500);
 }
 
@@ -858,6 +879,9 @@ static void teb_stream_send_headers(TObj *s) {
         char *cl = teb_sess_cookie_line((TObj *)s->props[5].u.p);
         if (cl) { teb_wr(conn, cl, strlen(cl)); tm_free(cl); }
     }
+    /* 无 Content-Length → close 定界：同时通知 civetweb 侧放弃 keep-alive
+     * 循环，否则服务端会继续等下一个请求而客户端在等服务端关 → 僵持。 */
+    mg_disable_connection_keep_alive(conn);
     teb_wr(conn, "Connection: close\r\n\r\n", 21);
 }
 
@@ -1687,8 +1711,10 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     TArr *arr = (TArr *)args[0].u.p;
     tarr_sync_buckets(arr);
     int64_t n_buckets = arr->bcap;
-    const char **opts = tm_malloc(sizeof(char *) * (size_t)(n_buckets * 2 + 1));
+    /* +4：缺省追加 enable_keep_alive 用（批1 keep-alive，见循环后） */
+    const char **opts = tm_malloc(sizeof(char *) * (size_t)(n_buckets * 2 + 4));
     int k = 0;
+    bool has_keep_alive = false;
     for (int64_t bi = 0; bi < n_buckets; bi++) {
         ABucket *bk = &arr->buckets[bi];
         if (bk->key.t == T_NULL) continue;
@@ -1698,6 +1724,8 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
         TStr *ks = (TStr *)bk->key.u.p;
         const char *kc = tstr_val(ks);
         TVal val = arr->data[bk->val_off];
+
+        if (strcmp(kc, "enable_keep_alive") == 0) has_keep_alive = true;
 
         if (strcmp(kc, "upload_tmp_dir") == 0) {
             TStr *vs;
@@ -1757,6 +1785,12 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
         }
         opts[k++] = tstr_val(vs);   /* civetweb 内部拷贝 */
         tval_release(&tmp);
+    }
+    /* keep-alive 缺省开启（用户显式传值优先）：civetweb 配置表默认 no，
+     * 不改 vendor——在 teb 侧透传注入，升级 civetweb 不丢。 */
+    if (!has_keep_alive) {
+        opts[k++] = teb_dup("enable_keep_alive");
+        opts[k++] = "yes";
     }
     opts[k] = NULL;
 
