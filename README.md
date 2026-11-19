@@ -1,6 +1,6 @@
 # Teb
 
-`tphp/teb` 是基于 [civetweb](https://github.com/civetweb/civetweb) 的 HTTP 服务器扩展包（type=ext），以三个原生类的形式链入 tphp——`Tphp\Teb\Web` 服务器对象、`Tphp\Teb\Request` 请求对象、`Tphp\Teb\Response` 响应对象。回调收发全部对象化，无句柄、无手拼 HTTP 头、无轮询循环。
+`tphp/teb` 是基于 [civetweb](https://github.com/civetweb/civetweb) 的 HTTP 服务器扩展包（type=ext），以七个原生类的形式链入 tphp——`Tphp\Teb\Web` 服务器对象、`Tphp\Teb\Request` 请求对象、`Tphp\Teb\Response` 响应对象、`Tphp\Teb\Session` 会话对象、`Tphp\Teb\Stream` 流式响应、`Tphp\Teb\UploadedFile` 上传文件、`Tphp\Teb\WebSocket` 连接对象。回调收发全部对象化，无句柄、无手拼 HTTP 头、无轮询循环。
 
 内置 civetweb 2025 master 源码（`civetweb/` 目录），随包一起编译，无运行时动态库依赖。
 
@@ -42,12 +42,32 @@ $web->run();    // 阻塞常驻（Ctrl+C 停止；对象析构自动 stop）
 
 完整示例见 [example/hello.php](example/hello.php)。
 
+## 会话（登录态）
+
+```php
+$web->route("/login", function (Request $r) {
+    $r->session()->set("user", "alice");   // 惰性打开；Set-Cookie 自动注入
+    return new Response("welcome");
+});
+
+$web->route("/whoami", fn(Request $r) =>
+    new Response("user=" . $r->session()->get("user", "-")));
+
+$web->route("/logout", function (Request $r) {
+    $r->session()->destroy();              // 删数据 + 清 cookie
+    return new Response("bye");
+});
+```
+
+会话 id 为 64 位随机 hex（cookie 名 `tphp_sid`，`HttpOnly; SameSite=Lax`），文件存储于 `session_save_path`（缺省系统临时目录下 `tphp_sess`），空闲 `session_lifetime`（缺省 14 天）后过期，活跃会话滑动续期。完整行为契约与限制见 [doc/API.md](doc/API.md) 的 Session 节。
+
 ## 测试
 
 ```bash
 bash tests/run.sh              # 总冒烟：33 项断言，约 40s（请求体上限 413/抛 Error + 413 计数 + 头超限 400 用例）
 bash tests/run_p0.sh           # P0 冒烟：45 项断言（流式/上传/notFound/助手/工厂/stop）
 bash tests/run_p1.sh           # P1 冒烟：30 项断言（before/静态/stats/WS 含帧层）
+bash tests/run_session.sh      # Session/cookie opts 冒烟：33 项断言（会话链/注入/过期/GC）
 bash example/smoke_examples.sh # 示例冒烟：40 项断言
 ```
 
@@ -63,7 +83,11 @@ body 回显、Response 链式配置（status/header/cookie/withHeaders）、500 
 回显与 bits/PING-PONG/分片装配/服务端 CLOSE/onClose/ws 统计）、请求体上限
 （声明 Content-Length 入口 413、chunked 读取超限抛 Error 可捕获、恰好等于
 上限放行、multipart 文本字段超限 form() 抛 Error、入口 413 计入 stats、
-请求头超 max_request_size 由 civetweb 回 400）。
+请求头超 max_request_size 由 civetweb 回 400）、Session（Set-Cookie 格式与
+滑动续期、jar 跨请求读写/计数持久化、异常路径 flush、regenerateId、空闲过期
+换新 sid、destroy 清 cookie、惰性零副作用、流式先开/后开注入差异、静态与
+before 路径注入、伪造 sid 拒绝、过期文件 GC）与 `Response::cookie` 三参
+opts（全属性字段、非法键 ValueError 可捕获）。
 
 ## 功能特性
 
@@ -107,7 +131,7 @@ gzip 在 Linux/macOS 使用系统 zlib；Windows 默认不启用（避免引入�
 
 ## API 参考
 
-完整 API 分组表见 **[doc/API.md](doc/API.md)**：`Web` / `Request` / `Response` / `Stream` / `UploadedFile` / `WebSocket` 六个类的方法名、参数、返回值与说明，含 `start()` 配置项表与各对象行为契约（流式回调、上传 tmp 生命周期、WS 帧层已知差异）。
+完整 API 分组表见 **[doc/API.md](doc/API.md)**：`Web` / `Request` / `Response` / `Session` / `Stream` / `UploadedFile` / `WebSocket` 七个类的方法名、参数、返回值与说明，含 `start()` 配置项表与各对象行为契约（会话存储与注入限制、流式回调、上传 tmp 生命周期、WS 帧层已知差异）。
 
 ## 路由匹配规则（按优先级）
 
@@ -134,6 +158,7 @@ gzip 在 Linux/macOS 使用系统 zlib；Windows 默认不启用（避免引入�
 - **回调返回值**：必须是 `Response`（或流式回调——见 doc/API.md Stream 契约）；否则打 warning 并自动回 500。
 - **multipart 勿先调 `body()`**：`form()` 的 multipart 分支会耗尽连接 body，之后 `body()`/`json()` 得到空串。
 - **上传 `moveTo()` 须在回调内完成**：回调结束后未移动的 tmp 文件由 drain 自动回收。
-- **配置值全部为字符串**：`start()` 的 options 值必须是 string，整数需显式转换；`upload_tmp_dir`/`upload_max_bytes` 为 teb 自留键。
+- **配置值全部为字符串**：`start()` 的 options 值必须是 string，整数需显式转换；`upload_tmp_dir`/`upload_max_bytes`/`session_save_path`/`session_lifetime`/`session_gc_interval` 为 teb 自留键。
 - **请求大小是两层限制**：请求行+头看 `max_request_size`（civetweb，缺省 16K，头超限 civetweb 直接回 400，PHP 侧无感知）；请求体看 `upload_max_bytes`（缺省 64M）——声明 `Content-Length` 的非 multipart 请求超限在入口直接 413（回调不执行，计入 stats），chunked/未声明长度读取超限由 `body()`/`json()`/`form()` 抛 `Error`（不 catch → 500），multipart 文件超限保留 `UploadedFile::error()=1` 语义、文本字段超限则 `form()` 抛 `Error`（重复抛；完整接收的文件仍可 `file()`/`files()` 取）。
 - **编译与功能**：HTTPS/WebSocket/IPv6/CGI/缓存/统计全量启用；gzip 仅 Linux/macOS 默认启用（见「功能特性」「跨平台编译」两节）。
+- **会话**：文件存储在 `session_save_path`（缺省系统临时目录下 `tphp_sess`），仅调用过 `$r->session()` 的请求才下发 cookie 与读写文件；Set-Cookie 自动注入覆盖正常/500/流式未发头/静态四类路径，静态 304、流式首次 `write()` 之后、WS `onOpen` 三处不注入；同一 `session_save_path` 不可多进程共用。完整契约与限制见 doc/API.md 的 Session 节。

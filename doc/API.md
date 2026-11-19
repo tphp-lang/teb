@@ -35,8 +35,11 @@
 | `protect_uri` | 需要保护的路径列表 | `"uri1,uri2"` |
 | `upload_tmp_dir` | **teb 自留键**：上传 tmp 目录（缺省系统临时目录） | `"/tmp/up"` |
 | `upload_max_bytes` | **teb 自留键**：请求体/上传累计上限（字节，缺省 64M）。非 multipart 且声明 `Content-Length` 超限 → **入口 413** 不进回调；chunked/未声明长度读取超限 → `body()`/`json()`/`form()` **抛 `Error`**；multipart → `UploadedFile::error()=1` | `"10485760"` |
+| `session_save_path` | **teb 自留键**：会话文件目录（缺省系统临时目录下 `tphp_sess`；父目录须存在，目录缺失时自动创建） | `"/var/lib/tphp/sess"` |
+| `session_lifetime` | **teb 自留键**：会话空闲过期秒数（缺省 `1209600`，14 天）。cookie `Max-Age` 与服务端文件 TTL 同值 | `"86400"` |
+| `session_gc_interval` | **teb 自留键**：会话目录过期文件清扫的节流秒数（缺省 `300`） | `"60"` |
 
-- 自留键被识别后摘除，不透传 civetweb；传入未知配置项会导致启动失败（抛 `Error`）。
+- 自留键（`upload_tmp_dir` / `upload_max_bytes` / `session_*`）被识别后摘除，不透传 civetweb；传入未知配置项会导致启动失败（抛 `Error`）。
 
 ### `class` 类名 `Request`
 
@@ -67,6 +70,7 @@
 | `form` | - | array | 表单解析（惰性，结果缓存）：GET/HEAD 解析 query；`multipart/form-data` 走完整表单解析（**会耗尽 body，勿先调 `body()`**）；其余读 body 缓存后按 urlencoded 解析。**解析失败/文本字段超 `upload_max_bytes` 抛 `Error`**（不缓存半截文本；重复调用重复抛，完整接收的文件仍可 `file()`/`files()` 取） |
 | `file` | `string` `$name` 字段名 | ?UploadedFile | 单个上传文件；非 multipart 或无此名返回 `null`；首次触发的表单解析失败同样抛 `Error` |
 | `files` | - | array | 全部上传文件（`name => UploadedFile`；非 multipart 为空数组） |
+| `session` | - | Session | 打开会话（**惰性**：首次调用读取/生成会话 id，同请求幂等缓存）；未调用不产生任何 cookie 与文件 I/O。行为契约与限制见 Session 节 |
 | `beginStream` | `int` `$status` = 200 状态码 <br> `array` `$headers` = [] 响应头 | Stream | 开始流式响应（契约见 Stream）；幂等：重复调用返回同一实例 |
 
 ### `class` 类名 `Response`
@@ -77,10 +81,26 @@
 | :--- | :--- | :--- | :--- |
 | `__construct` | `string` `$body` = "" 响应体 <br> `int` `$status` = 200 状态码 <br> `array` `$headers` = [`"Content-Type" => "text/plain"`] 响应头 | - | 默认 Content-Type `text/plain` |
 | `header` | `string` `$k` 键 <br> `string` `$v` 值 | self | 追加/覆盖响应头 |
-| `cookie` | `string` `$k` 键 <br> `string` `$v` 值 | self | 设置 `Set-Cookie` |
+| `cookie` | `string` `$k` 键 <br> `string` `$v` 值 <br> `array` `$opts` = [] 属性 | self | 设置 `Set-Cookie`；`$opts` 支持的属性键见下方子表 |
 | `withHeaders` | `array` `$headers` 头表 | self | 批量合并响应头；传非数组抛 `TypeError` |
 | `status` | `int` `$code` 状态码 | self | 修改状态码（默认 200） |
 | `body` | - | string | 读取当前响应体 |
+
+#### `cookie()` 的 `$opts` 属性键
+
+| 键 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `path` | string | `Path` 属性 |
+| `domain` | string | `Domain` 属性 |
+| `expires` | int | Unix 时间戳 → `Expires` 属性（GMT IMF-fixdate 格式） |
+| `max_age` | int | `Max-Age` 属性（秒） |
+| `secure` | bool | 输出 `Secure` 标志 |
+| `httponly` | bool | 输出 `HttpOnly` 标志 |
+| `sameSite` / `same_site` | string | 仅 `"Lax"` / `"Strict"` / `"None"`（大小写不敏感） |
+
+- 属性键**大小写不敏感**；未知键 → `ValueError`（拼错键静默丢安全标志比报错更危险）；类型不符 → `TypeError`；非法 `sameSite` 取值 → `ValueError`。
+- `$v` / `path` / `domain` 含 CR/LF → `ValueError`（响应分割注入防线）。
+- 属性按固定顺序拼接在值尾部：`Path → Domain → Expires → Max-Age → Secure → HttpOnly → SameSite`；不传 `$opts` 时输出与旧版完全一致（`k=v`）。
 
 #### 静态工厂（native static，`Response::json(...)` 直接调用）
 
@@ -99,8 +119,61 @@ return new Response("created", 201)
     ->header("X-Request-Id", $id)
     ->cookie("sid", $sid);
 
+return new Response("remembered", 200)
+    ->cookie("remember", $v, ["httponly" => true, "max_age" => 2592000,
+                               "sameSite" => "Lax"]);
+
 return Response::json(["ok" => true]);
 return Response::redirect("/login");
+```
+
+### `class` 类名 `Session`
+
+`$req->session()` 的产物——服务端会话（**不可手动 `new`**，构造器抛 `Error`）。数据在回调结束时自动落盘；**`Set-Cookie` 由 teb 在响应写出时自动注入**（覆盖正常响应、500 兜底、流式未发头、静态文件四类路径）。
+
+| 方法名 | 参数 | 返回值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `id` | - | string | 会话 id（64 位小写 hex） |
+| `get` | `string` `$k` 键 <br> `mixed` `$default` = null 缺省值 | mixed | 取值，缺失返回 `$default` |
+| `set` | `string` `$k` 键 <br> `mixed` `$v` 值 | self | 存值；顶层值必须是 null/bool/int/float/string/array，否则 `TypeError`；`destroy()` 之后调用会**换新 id 复活**会话（防会话固定） |
+| `has` | `string` `$k` 键 | bool | 是否存在 |
+| `remove` | `string` `$k` 键 | self | 删除一项 |
+| `all` | - | array | 全部数据的**副本** |
+| `destroy` | - | void | 立即删除服务端数据并下发清除 cookie（本响应 `Max-Age=0`） |
+| `regenerateId` | - | self | 换新会话 id（防会话固定），数据保留，旧 id 服务端立即失效 |
+
+#### 行为契约
+
+- **cookie**：名 `tphp_sid`，值 64 位小写 hex；形态 `tphp_sid=<id>; Path=/; HttpOnly; SameSite=Lax; Max-Age=<session_lifetime>`；非法/缺失的入站 id 一律视为新会话（伪造防线）。
+- **滑动续期**：每个持有会话的响应都重发 `Set-Cookie` 并刷新服务端数据文件——活跃会话永不过期；空闲超过 `session_lifetime` 后 cookie 与服务端数据同时过期。
+- **存储**：`session_save_path` 目录下单文件 JSON 序列化（每 id 一个文件，写入走临时文件原子替换）；过期文件按 `session_gc_interval` 节流清扫。
+- **惰性**：不调用 `$r->session()` 的请求不产生任何 Set-Cookie、不发生会话文件 I/O。
+- 用户在 Response 上自行 `->cookie("tphp_sid", …)` 时，自动注入让位（不覆盖用户值）。
+- 回调抛异常（→ 500）时会话数据仍会落盘，500 响应同样携带 Set-Cookie。
+
+#### 限制
+
+- 数据必须可 JSON 编码：`set()` 顶层拒绝对象/闭包（`TypeError`）；嵌套不可编码值不落盘（仅打印警告，旧数据保留）。
+- 静态文件命中 `If-Modified-Since` 的 **304 响应不带自动 Set-Cookie**；登录态下发请走动态端点。
+- 流式响应须**先 `session()` 后首次 `write()`** 才能拿到 Set-Cookie（响应头发出后无法追加）；之后才打开的会话本响应无 cookie。
+- WebSocket 握手完成后才进入 `onOpen`，其内打开的会话**不下发 cookie**（数据仍照常落盘）。
+- 同一 `session_save_path` **不可多进程共用**（无跨进程锁）。
+
+```php
+$web->route("/login", function (Request $r) {
+    $s = $r->session();
+    $s->set("user", "alice");
+    return new Response("welcome");
+});
+
+$web->route("/whoami", function (Request $r) {
+    return new Response("user=" . $r->session()->get("user", "-"));
+});
+
+$web->route("/logout", function (Request $r) {
+    $r->session()->destroy();
+    return new Response("bye");
+});
 ```
 
 ### `class` 类名 `Stream`
@@ -118,7 +191,8 @@ return Response::redirect("/login");
 
 - 回调内调用过 `beginStream()` → **回调返回值一律忽略**（`return null` 或返回 `Response` 均可）；
 - 回调正常结束但未 `end()` → 自动收尾（未发头则发一个空体响应头）；
-- 回调抛异常：头已发 → 仅结束流（不写 500，客户端收到已发出的部分）；头未发 → 照常写 500。
+- 回调抛异常：头已发 → 仅结束流（不写 500，客户端收到已发出的部分）；头未发 → 照常写 500；
+- 会话注入：须**先 `$r->session()` 再首次 `write()`** 才能随响应头带出 Set-Cookie（见 Session 节限制）。
 
 **写法注意**：流式回调的返回值被忽略，**不要声明 `: Response` 返回类型**再 `return null`——类型检查失败会抛 TypeError（当前引擎实现下该异常虽不影响本请求响应，但会污染后续请求的回调执行，修复前请按无返回类型声明书写）。
 

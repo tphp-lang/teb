@@ -8,6 +8,8 @@
  *                         /start()/run()/drain()/stop()/stats()
  *   Tphp\Teb\Request      路由回调入参：method()/uri()/header()/body()/form()/file()...
  *   Tphp\Teb\Response     回调返回值：new Response(...) + 链式 + 静态工厂 json/text/html/redirect/file
+ *   Tphp\Teb\Session      服务端会话：$r->session() 惰性打开，id/get/set/has/remove/all/
+ *                         destroy/regenerateId；Set-Cookie 由响应写出点自动注入
  *   Tphp\Teb\Stream       流式响应：beginStream() 产物，惰性发头、close 定界
  *   Tphp\Teb\UploadedFile 上传文件：form()/files() 产物，moveTo() 落盘
  *   Tphp\Teb\WebSocket    WS 连接（P1）：websocket() 回调入参，send/ping/close/remoteAddr
@@ -26,6 +28,8 @@
  *   回调异常/非 Response → C 侧写 500（异常信息照常打印）；流式回调返回值
  *   一律忽略（收尾契约见 doc/API.md Stream 节）。
  *   stats 计数全部在 PHP 主线程写（drain/回调），thunk/WS 回调线程不写 → 无锁。
+ *   Session：文件读写与 GC 全部在 drain 主线程（与回调串行），无锁；Set-Cookie
+ *   在写出时刻注入（正常/500/流式未发头/静态四类路径），数据 flush 挂 reclaim 后。
  */
 #include "pkg.h"            /* tphp_ext_reg_const_str / tphp_ext_reg_fn / tphp_json_encode_c */
 #include "value.h"          /* TVal / TV_* / tstr_* / tm_* */
@@ -45,6 +49,12 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+
+/* ---- Session（doc/API.md Session 节）---- */
+#define TEB_SESS_COOKIE     "tphp_sid"          /* 会话 cookie 名 */
+#define TEB_SESS_SID_LEN    64                  /* 64 位小写 hex（32B CSPRNG） */
+#define TEB_SESS_MAX_BYTES  (1 << 20)           /* 单会话文件读上限 1MB */
+#define TEB_SESS_PATH_CAP   512                 /* save_path(400) + '/' + sid(64) + ".tmp" */
 
 /* 统一分配器：tm_malloc + memcpy。勿用 libc strdup —— stop 释放路由表走
  * tm_free，strdup 块与之混搭会 mi_free invalid pointer（2026-11-14 冒烟实测）。 */
@@ -157,6 +167,10 @@ typedef struct {
     TVal web_obj;              /* 运行中 Web 对象（+1；real_stop 释放） */
     char upload_tmp_dir[400];  /* 上传 tmp 目录（start 自留键；缺省系统 tmp） */
     int64_t upload_max_bytes;  /* 上传/单字段累计上限（缺省 64M） */
+    char session_save_path[400];   /* 会话文件目录（start 自留键；缺省 <tmp>/tphp_sess） */
+    int64_t session_lifetime;      /* 会话空闲过期秒数（缺省 1209600 = 14 天） */
+    int64_t session_gc_interval;   /* 目录 GC 节流秒数（缺省 300） */
+    int64_t session_last_gc;       /* 上次全量 GC 时刻（start 复位 0） */
     TebStats st;               /* P1-1 运行统计 */
 } TebGlobal;
 
@@ -169,6 +183,7 @@ static _Thread_local TClass *g_resp_cls;
 static _Thread_local TClass *g_stream_cls;
 static _Thread_local TClass *g_upfile_cls;
 static _Thread_local TClass *g_ws_cls;
+static _Thread_local TClass *g_sess_cls;
 
 /* 首次初始化必须发生在 Web::start（PHP 主线程、mg_start 创建 worker 之前） */
 static void teb_lock(void) {
@@ -184,6 +199,13 @@ static void teb_lock(void) {
 
 /* Request info 缓存读取（定义于 Request 方法区；此处前置） */
 static TVal teb_info_get(TObj *o, const char *key);
+
+/* Session（定义于 Session 方法区；响应写出点在本文件更早处）：
+ * 取 Request 上缓存的会话对象（无则 NULL）；生成 Set-Cookie 整行
+ * （tm_malloc，调用方 tm_free；无会话返回 NULL）。 */
+static TObj *teb_sess_of(TObj *req);
+static char *teb_sess_cookie_line(TObj *sess);
+static void teb_session_flush(TObj *req);
 
 /* P1-1 统一写出口：全部 PHP 侧响应写出走此（bytes_sent 累加）。
  * 主线程（drain/回调）与 thunk 线程（入口 413）都会调 → 计数加锁。 */
@@ -748,8 +770,10 @@ static void teb_emit_pairs(struct mg_connection *conn, TArr *a,
     }
 }
 
-/* Response 对象（props: 0=status 1=body 2=headers 3=cookies）→ 写出 */
-static void teb_write_response(struct mg_connection *conn, TObj *r) {
+/* Response 对象（props: 0=status 1=body 2=headers 3=cookies）→ 写出。
+ * req = 本请求（会话注入用；可 NULL）。会话 Set-Cookie 在用户头/用户
+ * cookie 之后注入——用户自己 ->cookie("tphp_sid",…) 时跳过（用户优先）。 */
+static void teb_write_response(struct mg_connection *conn, TObj *r, TObj *req) {
     int64_t status = (r->props[0].t == T_INT) ? r->props[0].u.i : 200;
     TStr *body = (r->props[1].t == T_STR) ? (TStr *)r->props[1].u.p : NULL;
     const char *reason = mg_get_response_code_text(conn, (int)status);
@@ -762,8 +786,20 @@ static void teb_write_response(struct mg_connection *conn, TObj *r) {
 
     if (r->props[2].t == T_ARR)
         teb_emit_pairs(conn, (TArr *)r->props[2].u.p, "", ": ");
-    if (r->props[3].t == T_ARR)
-        teb_emit_pairs(conn, (TArr *)r->props[3].u.p, "Set-Cookie: ", "=");
+    if (r->props[3].t == T_ARR) {
+        TArr *cks = (TArr *)r->props[3].u.p;
+        teb_emit_pairs(conn, cks, "Set-Cookie: ", "=");
+        /* 会话注入守卫：用户已设同名 cookie → 不注入 */
+        TVal *own = tarr_get(cks, TV_STR(tstr_intern(TEB_SESS_COOKIE,
+                                                     strlen(TEB_SESS_COOKIE))));
+        if (!own || own->t == T_UNDEF) {
+            char *cl = teb_sess_cookie_line(teb_sess_of(req));
+            if (cl) { teb_wr(conn, cl, strlen(cl)); tm_free(cl); }
+        }
+    } else {
+        char *cl = teb_sess_cookie_line(teb_sess_of(req));
+        if (cl) { teb_wr(conn, cl, strlen(cl)); tm_free(cl); }
+    }
 
     size_t blen = body ? body->len : 0;
     ln = snprintf(line, sizeof line,
@@ -772,22 +808,28 @@ static void teb_write_response(struct mg_connection *conn, TObj *r) {
     if (body && blen) teb_wr(conn, body->c, (unsigned long long)blen);
 }
 
-/* 回调异常 / 未返回 Response 的兜底 */
-static const char TEB_500[] =
+/* 回调异常 / 未返回 Response 的兜底。HEAD/TAIL 拆分供会话 cookie 注入，
+ * 拼接后与拆分前逐字节相同（既有 500 断言不受影响）。 */
+static const char TEB_500_HEAD[] =
     "HTTP/1.1 500 Internal Server Error\r\n"
-    "Content-Type: text/plain\r\nContent-Length: 21\r\n"
+    "Content-Type: text/plain\r\n";
+static const char TEB_500_TAIL[] =
+    "Content-Length: 21\r\n"
     "Connection: close\r\n\r\nInternal Server Error";
 
-static void teb_write_500(struct mg_connection *conn) {
-    teb_wr(conn, TEB_500, sizeof TEB_500 - 1);
+static void teb_write_500(struct mg_connection *conn, TObj *req) {
+    teb_wr(conn, TEB_500_HEAD, sizeof TEB_500_HEAD - 1);
+    char *cl = teb_sess_cookie_line(teb_sess_of(req));
+    if (cl) { teb_wr(conn, cl, strlen(cl)); tm_free(cl); }
+    teb_wr(conn, TEB_500_TAIL, sizeof TEB_500_TAIL - 1);
     teb_stat_resp(500);
 }
 
 /* ---- 流式响应（doc/API.md Stream 节） ----
- * Stream props: 0=conn 1=status 2=headers 3=header_sent 4=ended */
+ * Stream props: 0=conn 1=status 2=headers 3=header_sent 4=ended 5=session */
 
-/* 惰性头发送：HTTP/1.1 <status> <reason> + 用户头 + Connection: close。
- * 不带 Content-Length、不用 chunked（close 定界）。幂等。 */
+/* 惰性头发送：HTTP/1.1 <status> <reason> + 用户头 + 会话 Set-Cookie +
+ * Connection: close。不带 Content-Length、不用 chunked（close 定界）。幂等。 */
 static void teb_stream_send_headers(TObj *s) {
     if (s->props[3].t == T_TRUE) return;
     s->props[3] = TV_TRUE;
@@ -801,8 +843,21 @@ static void teb_stream_send_headers(TObj *s) {
                       (long long)status, reason ? reason : "OK");
     teb_wr(conn, line, (unsigned long long)ln);
     teb_stat_resp(status);
-    if (s->props[2].t == T_ARR)
-        teb_emit_pairs(conn, (TArr *)s->props[2].u.p, "", ": ");
+    if (s->props[2].t == T_ARR) {
+        TArr *h = (TArr *)s->props[2].u.p;
+        teb_emit_pairs(conn, h, "", ": ");
+        /* 会话注入：头未发且用户未自带 Set-Cookie（Stream 手写头无 key 模型，
+         * 以「是否存在任意 Set-Cookie 行」为守卫） */
+        TVal *own = tarr_get(h, TV_STR(tstr_intern("Set-Cookie",
+                                                   strlen("Set-Cookie"))));
+        if ((!own || own->t == T_UNDEF) && s->props[5].t == T_OBJ) {
+            char *cl = teb_sess_cookie_line((TObj *)s->props[5].u.p);
+            if (cl) { teb_wr(conn, cl, strlen(cl)); tm_free(cl); }
+        }
+    } else if (s->props[5].t == T_OBJ) {
+        char *cl = teb_sess_cookie_line((TObj *)s->props[5].u.p);
+        if (cl) { teb_wr(conn, cl, strlen(cl)); tm_free(cl); }
+    }
     teb_wr(conn, "Connection: close\r\n\r\n", 21);
 }
 
@@ -1255,7 +1310,7 @@ static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
         tval_release(&argv);
         if (!ok) return false;   /* before 异常：外层按流式状态收尾 */
         if (out.t == T_OBJ && ((TObj *)out.u.p)->cls == g_resp_cls) {
-            teb_write_response(conn, (TObj *)out.u.p);   /* 短路 */
+            teb_write_response(conn, (TObj *)out.u.p, req);   /* 短路 */
             tval_release(&out);
             return true;
         }
@@ -1263,7 +1318,7 @@ static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
             tphp_warn("PHP Warning: Teb before callback must return null "
                       "or a Tphp\\Teb\\Response instance\n");
             tval_release(&out);
-            teb_write_500(conn);
+            teb_write_500(conn, req);
             return true;
         }
         tval_release(&out);
@@ -1278,20 +1333,24 @@ static bool teb_dispatch(VM *vm, TObj *req, struct mg_connection *conn,
         tval_release(&argv);
         if (!ok) return false;   /* route 异常：外层按流式状态收尾 */
         if (out.t == T_OBJ && ((TObj *)out.u.p)->cls == g_resp_cls) {
-            teb_write_response(conn, (TObj *)out.u.p);
+            teb_write_response(conn, (TObj *)out.u.p, req);
         } else if (req->props[4].t == T_OBJ) {
             /* 流式接管：返回值一律忽略 */
         } else {
             tphp_warn("PHP Warning: Teb route callback must return "
                       "a Tphp\\Teb\\Response instance\n");
-            teb_write_500(conn);
+            teb_write_500(conn, req);
         }
         tval_release(&out);
         return true;
     }
 
     if (static_path) {
-        mg_send_mime_file(conn, static_path, NULL);
+        /* 会话注入：mg_send_mime_file2 的 additional_headers 挂 Set-Cookie
+         * （civetweb 源码零改动；注意 304 分支不透传 → 文档限制） */
+        char *cl = teb_sess_cookie_line(teb_sess_of(req));
+        mg_send_mime_file2(conn, static_path, NULL, cl);
+        if (cl) tm_free(cl);
         teb_stat_resp(200);
         teb_lock();
         g_teb.st.bytes_sent += static_size;   /* 近似：内部写出不走 teb_wr */
@@ -1361,7 +1420,7 @@ static void teb_drain_once(VM *vm) {
             g_teb.st.requests_active++;
             /* 构造回调入参 Request（不走 ctor；drain 持有其 rc）。
              * props: 0=conn 1=info 2=form_cache 3=files_cache 4=stream_obj
-             *        5=body_cache 6=qp_cache 7=cookie_cache */
+             *        5=body_cache 6=qp_cache 7=cookie_cache 8=session */
             TObj *req = tphp_obj_alloc(g_req_cls);
             req->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
             req->props[1] = TV_ARR(teb_req_info_arr(q->conn));
@@ -1383,16 +1442,17 @@ static void teb_drain_once(VM *vm) {
                     } else {
                         stream->props[3] = TV_TRUE;
                         stream->props[4] = TV_TRUE;
-                        teb_write_500(q->conn);
+                        teb_write_500(q->conn, req);
                     }
                 } else if (stream->props[4].t != T_TRUE) {
                     teb_stream_send_headers(stream);   /* 未发头 → 空体响应头 */
                     stream->props[4] = TV_TRUE;
                 }
             } else if (!ok) {
-                teb_write_500(q->conn);   /* 非 流式 + 回调异常 */
+                teb_write_500(q->conn, req);   /* 非 流式 + 回调异常 */
             }
-            teb_reclaim_tmp(req);   /* 未 moveTo 的上传 tmp 回收 */
+            teb_reclaim_tmp(req);      /* 未 moveTo 的上传 tmp 回收 */
+            teb_session_flush(req);    /* 会话落盘（dispatch 全分支必经此点） */
             tval_release(&argv);   /* Request 对象（回调捕获则继续存活） */
             g_teb.st.requests_active--;
         } else if (q->kind == TEQ_WS_OPEN) {
@@ -1419,6 +1479,7 @@ static void teb_drain_once(VM *vm) {
                 tphp_warn("PHP Warning: Teb WS onOpen callback raised (ignored)\n");
             tval_release(&out);
             tval_release(&args2[0]);   /* node 持份保留 */
+            teb_session_flush(rq);     /* WS 无 HTTP 响应可注入；数据照常落盘 */
             tval_release(&args2[1]);   /* Request 引用尽（drain 持份） */
         } else if (q->kind == TEQ_WS_MSG) {
             /* 帧层（RFC6455 子集）：控制帧不出回调——PING 自动回 PONG、
@@ -1602,6 +1663,24 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     if (g_teb.upload_max_bytes <= 0)
         g_teb.upload_max_bytes = 64LL * 1024 * 1024;
 
+    /* P1-5 Session 自留键缺省（doc/API.md start 配置表：
+     * session_save_path / session_lifetime / session_gc_interval） */
+    if (g_teb.session_save_path[0] == 0) {
+        char t[380];
+        size_t tl = sizeof t;
+        if (uv_os_tmpdir(t, &tl) == 0 && tl > 0)
+            snprintf(g_teb.session_save_path, sizeof g_teb.session_save_path,
+                     "%.*s/tphp_sess", (int)(tl > 370 ? 370 : tl), t);
+        else
+            snprintf(g_teb.session_save_path, sizeof g_teb.session_save_path,
+                     "./tphp_sess");
+    }
+    if (g_teb.session_lifetime <= 0)
+        g_teb.session_lifetime = 1209600;      /* 14 天 */
+    if (g_teb.session_gc_interval <= 0)
+        g_teb.session_gc_interval = 300;
+    g_teb.session_last_gc = 0;                 /* 每次 start 后允许立即 GC */
+
     /* assoc 数组展平成 key1,val1,...,NULL 的 const char**；
      * upload_tmp_dir/upload_max_bytes 为 teb 自留键——识别后摘除不透传
      * （透传 civetweb 会 unknown option 启动失败） */
@@ -1637,6 +1716,30 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
             else { vs = tval_to_str(val); tmp = TV_STR(vs); }
             int64_t mb = strtoll(tstr_val(vs), NULL, 10);
             g_teb.upload_max_bytes = mb > 0 ? mb : 64LL * 1024 * 1024;
+            tval_release(&tmp);
+            continue;
+        }
+        if (strcmp(kc, "session_save_path") == 0) {
+            TStr *vs;
+            TVal tmp = TV_NULL;
+            if (val.t == T_STR) vs = (TStr *)val.u.p;
+            else { vs = tval_to_str(val); tmp = TV_STR(vs); }
+            snprintf(g_teb.session_save_path, sizeof g_teb.session_save_path,
+                     "%s", tstr_val(vs));
+            tval_release(&tmp);
+            continue;
+        }
+        if (strcmp(kc, "session_lifetime") == 0 ||
+            strcmp(kc, "session_gc_interval") == 0) {
+            TStr *vs;
+            TVal tmp = TV_NULL;
+            if (val.t == T_STR) vs = (TStr *)val.u.p;
+            else { vs = tval_to_str(val); tmp = TV_STR(vs); }
+            int64_t iv = strtoll(tstr_val(vs), NULL, 10);
+            if (strcmp(kc, "session_lifetime") == 0)
+                g_teb.session_lifetime = iv;   /* <=0 由缺省块回落 */
+            else
+                g_teb.session_gc_interval = iv;
             tval_release(&tmp);
             continue;
         }
@@ -1945,7 +2048,7 @@ static TVal nm_req_body(VM *vm, void *self, TVal *args, int n) {
 
 /* ---- 解析助手（doc/API.md Request 节）----
  * Request props: 0=conn 1=info 2=form_cache 3=files_cache 4=stream_obj
- *                5=body_cache 6=qp_cache 7=cookie_cache
+ *                5=body_cache 6=qp_cache 7=cookie_cache 8=session
  * TV_NULL = 未解析哨兵（解析后必存 T_ARR / T_STR）。 */
 
 /* queryParams(): array —— query string urlencoded 解析（缓存 props[6]） */
@@ -2129,6 +2232,12 @@ static TVal nm_req_begin_stream(VM *vm, void *self, TVal *args, int n) {
     }
     s->props[3] = TV_FALSE;
     s->props[4] = TV_FALSE;
+    /* 反向同步：会话已开（先 session 后 beginStream）→ 挂 Stream 槽
+     * （发头时注入 Set-Cookie 用；正向分支见 teb_session_open） */
+    if (o->props[8].t == T_OBJ) {
+        s->props[5] = o->props[8];
+        tval_addref(s->props[5]);
+    }
     teb_set_slot(o, 4, TV_OBJ(s));   /* Request 持 +1（回调结束随 Request 释放） */
     tval_addref(TV_OBJ(s));          /* 返回 +1 */
     return TV_OBJ(s);
@@ -2275,13 +2384,144 @@ static TVal nm_resp_header(VM *vm, void *self, TVal *args, int n) {
     return TV_OBJ(o);
 }
 
-/* cookie(string $k, string $v): self */
+/* IMF-fixdate（"Wed, 21 Oct 2015 07:28:00 GMT"）—— 纯整数 civil-from-days
+ * 反推，勿用 gmtime（静态缓冲与 civetweb worker 线程有数据竞态）。 */
+static void teb_http_date(int64_t ts, char *buf, size_t cap) {
+    static const char *WD[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    static const char *MO[12] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                 "Jul","Aug","Sep","Oct","Nov","Dec"};
+    int64_t days = ts / 86400, rem = ts % 86400;
+    if (rem < 0) { rem += 86400; days -= 1; }
+    int64_t z = days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = yoe + era * 400;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    int64_t d = doy - (153 * mp + 2) / 5 + 1;
+    int64_t m = mp < 10 ? mp + 3 : mp - 9;
+    y += (m <= 2);
+    int64_t dow = (days + 4) % 7;              /* 1970-01-01 = 周四 = 4 */
+    if (dow < 0) dow += 7;
+    snprintf(buf, cap, "%s, %02lld %s %04lld %02lld:%02lld:%02lld GMT",
+             WD[dow], (long long)d, MO[m - 1], (long long)y,
+             (long long)(rem / 3600), (long long)(rem / 60 % 60),
+             (long long)(rem % 60));
+}
+
+/* cookie(string $k, string $v, array $opts = []): self
+ * opts 键大小写不敏感：path/domain(string)、expires/max_age(int)、
+ * secure/httponly(bool)、sameSite|same_site("Lax"|"Strict"|"None")。
+ * 未知键 → ValueError（拼错静默丢安全标志比报错危险）；类型错 → TypeError；
+ * $v/path/domain 含 CRLF → ValueError（响应分割注入防线）。
+ * 先校验零分配，全过后再拼后缀——tphp_vm_raise 是 longjmp。 */
 static TVal nm_resp_cookie(VM *vm, void *self, TVal *args, int n) {
     const char *k = arg_str(vm, args, n, 0, "Response::cookie");
     const char *v = arg_str(vm, args, n, 1, "Response::cookie");
+    const char *c_path = NULL, *c_domain = NULL, *c_ss = NULL;
+    int64_t c_exp = 0, c_ma = 0;
+    bool c_secure = false, c_http = false;
+    bool has_exp = false, has_ma = false;
+
+    if (strchr(v, '\r') || strchr(v, '\n'))
+        tphp_vm_raise(vm, "ValueError",
+                      "Response::cookie(): value must not contain CR/LF");
+
+    if (n >= 3 && args[2].t != T_ARR)
+        tphp_vm_raise(vm, "TypeError",
+                      "Response::cookie() expects an array of options");
+
+    TArr *opts = (n >= 3) ? (TArr *)args[2].u.p : NULL;
+    if (opts) {
+        tarr_sync_buckets(opts);
+        for (uint32_t b = 0; b < opts->bcap; b++) {
+            ABucket *bk = &opts->buckets[b];
+            if (bk->key.t == T_NULL || bk->val_off == UINT32_MAX) continue;
+            if (bk->key.t != T_STR)
+                tphp_vm_raise(vm, "ValueError",
+                              "Response::cookie(): option keys must be strings");
+            TStr *kstr = (TStr *)bk->key.u.p;
+            const char *kk = kstr->c;
+            TVal v = opts->data[bk->val_off];
+            if (str_icmp(kk, "path")) {
+                if (v.t != T_STR)
+                    tphp_vm_raise(vm, "TypeError", "Response::cookie(): path must be a string");
+                const char *s = tstr_val((TStr *)v.u.p);
+                if (strchr(s, '\r') || strchr(s, '\n'))
+                    tphp_vm_raise(vm, "ValueError", "Response::cookie(): path must not contain CR/LF");
+                c_path = s;
+            } else if (str_icmp(kk, "domain")) {
+                if (v.t != T_STR)
+                    tphp_vm_raise(vm, "TypeError", "Response::cookie(): domain must be a string");
+                const char *s = tstr_val((TStr *)v.u.p);
+                if (strchr(s, '\r') || strchr(s, '\n'))
+                    tphp_vm_raise(vm, "ValueError", "Response::cookie(): domain must not contain CR/LF");
+                c_domain = s;
+            } else if (str_icmp(kk, "expires")) {
+                if (v.t != T_INT)
+                    tphp_vm_raise(vm, "TypeError", "Response::cookie(): expires must be an int");
+                c_exp = v.u.i; has_exp = true;
+            } else if (str_icmp(kk, "max_age")) {
+                if (v.t != T_INT)
+                    tphp_vm_raise(vm, "TypeError", "Response::cookie(): max_age must be an int");
+                c_ma = v.u.i; has_ma = true;
+            } else if (str_icmp(kk, "secure")) {
+                if (v.t != T_TRUE && v.t != T_FALSE)
+                    tphp_vm_raise(vm, "TypeError", "Response::cookie(): secure must be a bool");
+                c_secure = (v.t == T_TRUE);
+            } else if (str_icmp(kk, "httponly")) {
+                if (v.t != T_TRUE && v.t != T_FALSE)
+                    tphp_vm_raise(vm, "TypeError", "Response::cookie(): httponly must be a bool");
+                c_http = (v.t == T_TRUE);
+            } else if (str_icmp(kk, "sameSite") || str_icmp(kk, "same_site")) {
+                if (v.t != T_STR)
+                    tphp_vm_raise(vm, "TypeError", "Response::cookie(): sameSite must be a string");
+                const char *s = tstr_val((TStr *)v.u.p);
+                if (!str_icmp(s, "Lax") && !str_icmp(s, "Strict") && !str_icmp(s, "None"))
+                    tphp_vm_raise(vm, "ValueError",
+                                  "Response::cookie(): sameSite must be Lax, Strict or None");
+                c_ss = s;
+            } else {
+                tphp_vm_raise(vm, "ValueError",
+                              "Response::cookie(): unknown option \"%.*s\"",
+                              (int)kstr->len, kk);
+            }
+        }
+    }
+
+    /* 校验全过 → 分配后缀（此后无 raise 点，顺序拼接固定） */
+    size_t cap = strlen(v) + 8;
+    if (c_path)   cap += strlen(c_path) + 10;
+    if (c_domain) cap += strlen(c_domain) + 12;
+    if (has_exp)  cap += 64;
+    if (has_ma)   cap += 32;
+    if (c_secure) cap += 10;
+    if (c_http)   cap += 12;
+    if (c_ss)     cap += strlen(c_ss) + 14;
+    char *buf = tm_malloc(cap);
+    size_t off = (size_t)snprintf(buf, cap, "%s", v);
+#define TEB_CK_FMT(...)  do { \
+        if ((size_t)off < cap) \
+            off += (size_t)snprintf(buf + off, cap - off, __VA_ARGS__); \
+    } while (0)
+    if (c_path)   TEB_CK_FMT("; Path=%s", c_path);
+    if (c_domain) TEB_CK_FMT("; Domain=%s", c_domain);
+    if (has_exp) {
+        char ed[64];
+        teb_http_date(c_exp, ed, sizeof ed);
+        TEB_CK_FMT("; Expires=%s", ed);
+    }
+    if (has_ma)   TEB_CK_FMT("; Max-Age=%lld", (long long)c_ma);
+    if (c_secure) TEB_CK_FMT("; Secure");
+    if (c_http)   TEB_CK_FMT("; HttpOnly");
+    if (c_ss)     TEB_CK_FMT("; SameSite=%s", c_ss);
+#undef TEB_CK_FMT
+
     TObj *o = (TObj *)self;
     TVal key = TV_STR(tstr_intern(k, strlen(k)));
-    TVal val = TV_STR(tstr_new(v, strlen(v)));
+    TVal val = TV_STR(tstr_new(buf, off));
+    tm_free(buf);
     teb_arr_set_borrowed(o, 3, key, val);
     tval_release(&val);
     tval_addref(TV_OBJ(o));
@@ -2420,8 +2660,11 @@ static TVal nm_resp_redirect(VM *vm, void *self, TVal *args, int n) {
 }
 
 /* P1-3 同步读整个文件（uv_fs；UTF-8 路径安全）。
+ * max_sz = 读取字节上限（Response::file 传 upload_max_bytes、session 传
+ * TEB_SESS_MAX_BYTES——耦合 g_teb 会让小上限配置打挂会话读取）。
  * 返回 0 成功（out/outlen 归调用方 tm_free）；1 不存在/不可读；2 超上限。 */
-static int teb_read_file(const char *path, char **out, size_t *outlen) {
+static int teb_read_file_max(const char *path, int64_t max_sz,
+                             char **out, size_t *outlen) {
     uv_fs_t r;
     if (uv_fs_open(NULL, &r, path, UV_FS_O_RDONLY, 0, NULL) < 0) {
         uv_fs_req_cleanup(&r);
@@ -2437,7 +2680,7 @@ static int teb_read_file(const char *path, char **out, size_t *outlen) {
     }
     int64_t sz = (int64_t)r.statbuf.st_size;
     uv_fs_req_cleanup(&r);
-    if (sz > g_teb.upload_max_bytes) {
+    if (sz > max_sz) {
         uv_fs_close(NULL, &r, fd, NULL);
         uv_fs_req_cleanup(&r);
         return 2;
@@ -2481,7 +2724,7 @@ static TVal nm_resp_file(VM *vm, void *self, TVal *args, int n) {
     }
     char *data = NULL;
     size_t dlen = 0;
-    int rc = teb_read_file(pathcopy, &data, &dlen);
+    int rc = teb_read_file_max(pathcopy, g_teb.upload_max_bytes, &data, &dlen);
     if (rc == 2) {
         tm_free(pathcopy);
         tphp_vm_raise(vm, "Error",
@@ -2499,8 +2742,430 @@ static TVal nm_resp_file(VM *vm, void *self, TVal *args, int n) {
     return TV_OBJ(r);
 }
 
+/* ---- Tphp\Teb\Session 原生方法（doc/API.md Session 节）----
+ * Session props: 0=id(str,64hex) 1=data(arr) 2=destroyed(bool)
+ * 配置（save_path/lifetime/gc）读 g_teb 不进对象 → 与 Request/Stream
+ * 无回指引用环。会话文件读写全部发生在 drain 主线程（与回调串行），无锁。 */
+
+/* 入站 sid 防线：恰好 64 位 hex 才接受（防路径拼接与伪造） */
+static bool teb_sid_valid(const char *s, size_t len) {
+    if (len != TEB_SESS_SID_LEN) return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+/* CSPRNG sid（uv_random 32B → 小写 hex）。失败返回 false——
+ * 调用方抛 Error，绝不回退弱熵（可预测 sid = 会话劫持，比 500 更糟）。 */
+static bool teb_sid_random(char out[TEB_SESS_SID_LEN + 1]) {
+    unsigned char raw[32];
+    if (uv_random(NULL, NULL, raw, sizeof raw, 0, NULL) != 0) return false;
+    static const char *hx = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = hx[raw[i] >> 4];
+        out[i * 2 + 1] = hx[raw[i] & 0xF];
+    }
+    out[TEB_SESS_SID_LEN] = 0;
+    return true;
+}
+
+static bool teb_sess_ensure_dir(void) {
+    uv_fs_t r;
+    int rc = uv_fs_mkdir(NULL, &r, g_teb.session_save_path, 0, NULL);
+    uv_fs_req_cleanup(&r);
+    if (rc == 0 || rc == UV_EEXIST) return true;
+    return false;
+}
+
+/* <save_path>/<sid> → buf（截断 → 返回 false，调用方按 Error 处理） */
+static bool teb_sess_path(char *buf, size_t cap, const char *sid) {
+    int n = snprintf(buf, cap, "%s/%s", g_teb.session_save_path, sid);
+    return n > 0 && (size_t)n < cap;
+}
+
+static int64_t teb_fs_mtime(const char *path) {
+    uv_fs_t r;
+    if (uv_fs_stat(NULL, &r, path, NULL) < 0) {
+        uv_fs_req_cleanup(&r);
+        return -1;
+    }
+    int64_t mt = (int64_t)r.statbuf.st_mtim.tv_sec;
+    uv_fs_req_cleanup(&r);
+    return mt;
+}
+
+/* 原子写：<sid>.tmp → unlink 目标 → rename（Windows rename 不覆盖既有）。
+ * 失败清 tmp 返回 false（调用方仅 warn——flush 在响应写出之后，无 raise 通路）。 */
+static bool teb_sess_write(const char *path, const char *d, size_t n) {
+    char tmp[TEB_SESS_PATH_CAP];
+    int ln = snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (ln <= 0 || (size_t)ln >= sizeof tmp) return false;
+    uv_fs_t r;
+    uv_file fd = uv_fs_open(NULL, &r, tmp,
+                            UV_FS_O_WRONLY | UV_FS_O_CREAT | UV_FS_O_TRUNC,
+                            0600, NULL);
+    uv_fs_req_cleanup(&r);
+    if (fd < 0) return false;
+    size_t off = 0;
+    bool ok = true;
+    while (off < n) {
+        uv_buf_t iov = uv_buf_init((char *)d + off, (unsigned)(n - off));
+        int64_t w = uv_fs_write(NULL, &r, fd, &iov, 1, (int64_t)off, NULL);
+        uv_fs_req_cleanup(&r);
+        if (w <= 0) { ok = false; break; }
+        off += (size_t)w;
+    }
+    uv_fs_close(NULL, &r, fd, NULL);
+    uv_fs_req_cleanup(&r);
+    if (!ok) { teb_fs_unlink(tmp); return false; }
+    teb_fs_unlink(path);              /* 不存在则失败，忽略 */
+    if (!teb_fs_rename(tmp, path)) { teb_fs_unlink(tmp); return false; }
+    return true;
+}
+
+/* 目录级 GC（节流：now - last_gc >= session_gc_interval 才扫）。按 mtime
+ * 清过期会话文件与残留 .tmp/孤儿——不按名字，崩溃残留同规则回收。
+ * 惰性单文件过期由 teb_session_open 的 mtime 检查负责，本函数只是回收。 */
+static void teb_sess_gc(void) {
+    int64_t now = (int64_t)time(NULL);
+    if (g_teb.session_last_gc != 0 &&
+        now - g_teb.session_last_gc < g_teb.session_gc_interval)
+        return;
+    g_teb.session_last_gc = now;
+    uv_fs_t req;
+    if (uv_fs_scandir(NULL, &req, g_teb.session_save_path, 0, NULL) < 0) {
+        uv_fs_req_cleanup(&req);
+        return;
+    }
+    uv_dirent_t ent;
+    char path[TEB_SESS_PATH_CAP];
+    while (uv_fs_scandir_next(&req, &ent) != UV_EOF) {
+        if (ent.type != UV_DIRENT_FILE && ent.type != UV_DIRENT_UNKNOWN)
+            continue;
+        if (!teb_sess_path(path, sizeof path, ent.name)) continue;
+        int64_t mt = teb_fs_mtime(path);
+        if (mt >= 0 && now - mt > g_teb.session_lifetime)
+            teb_fs_unlink(path);
+    }
+    uv_fs_req_cleanup(&req);
+}
+
+/* 取 Request 缓存的会话对象（未打开过 → NULL）——响应写出点前置声明 */
+static TObj *teb_sess_of(TObj *req) {
+    if (!req) return NULL;
+    return (req->props[8].t == T_OBJ) ? (TObj *)req->props[8].u.p : NULL;
+}
+
+/* Set-Cookie 整行（含 \r\n，直接写出）：destroyed → 清除形态（Max-Age=0）。
+ * tm_malloc，调用方 tm_free；无会话返回 NULL。 */
+static char *teb_sess_cookie_line(TObj *sess) {
+    if (!sess) return NULL;
+    char buf[256];
+    if (sess->props[2].t == T_TRUE) {
+        snprintf(buf, sizeof buf,
+                 "Set-Cookie: " TEB_SESS_COOKIE
+                 "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0\r\n");
+    } else {
+        TStr *id = (sess->props[0].t == T_STR) ? (TStr *)sess->props[0].u.p : NULL;
+        if (!id || id->len != TEB_SESS_SID_LEN) return NULL;
+        snprintf(buf, sizeof buf,
+                 "Set-Cookie: " TEB_SESS_COOKIE "=%.*s; Path=/; HttpOnly;"
+                 " SameSite=Lax; Max-Age=%lld\r\n",
+                 (int)id->len, id->c, (long long)g_teb.session_lifetime);
+    }
+    return teb_dup(buf);
+}
+
+/* 响应写出后统一落盘（drain 挂点调用）：滑动续期 = 每次打开都重写
+ * （mtime 刷新与 Set-Cookie 滑动配对）。严禁 raise/调 VM——此时响应已发出。 */
+static void teb_session_flush(TObj *req) {
+    TObj *sess = teb_sess_of(req);
+    if (!sess) return;
+    if (sess->props[2].t == T_TRUE) return;      /* destroyed：文件已删 */
+    if (sess->props[1].t != T_ARR) return;
+    TStr *id = (sess->props[0].t == T_STR) ? (TStr *)sess->props[0].u.p : NULL;
+    if (!id) return;
+    TStr *enc = NULL;
+    if (!tphp_json_encode_c(sess->props[1], &enc) || !enc) {
+        tphp_warn("PHP Warning: Teb session data is not JSON-encodable; "
+                  "session not persisted for this request\n");
+        return;
+    }
+    char path[TEB_SESS_PATH_CAP];
+    if (!teb_sess_path(path, sizeof path, tstr_val(id))) {
+        tval_release(&(TVal){ .t = T_STR, .u.p = enc });
+        tphp_warn("PHP Warning: Teb session_save_path too long; "
+                  "session not persisted\n");
+        return;
+    }
+    if (!teb_sess_write(path, tstr_val(enc), enc->len))
+        tphp_warn("PHP Warning: Teb session write failed (%s)\n", path);
+    tval_release(&(TVal){ .t = T_STR, .u.p = enc });
+}
+
+/* 惰性打开会话（$r->session()；同请求幂等）。读入站 cookie → 校验 →
+ * mtime 过期判定（惰性单文件过期）→ 读文件 JSON 解码 → GC → 建对象。 */
+static TObj *teb_session_open(VM *vm, TObj *req) {
+    if (req->props[8].t == T_OBJ) {
+        tval_addref(req->props[8]);
+        return (TObj *)req->props[8].u.p;
+    }
+    if (!teb_sess_ensure_dir())
+        tphp_vm_raise(vm, "Error",
+                      "Tphp\\Teb\\Request::session(): session_save_path is not"
+                      " usable (parent directory must exist; check"
+                      " \"session_save_path\" in Web::start())");
+
+    /* 入站 sid（复用 props[7] cookie 缓存；大小写不敏感接受后统一小写） */
+    if (req->props[7].t != T_ARR)
+        teb_set_slot(req, 7, TV_ARR(teb_parse_cookies(req)));
+    char sid[TEB_SESS_SID_LEN + 1] = {0};
+    bool have_sid = false;
+    {
+        TArr *cks = (TArr *)req->props[7].u.p;
+        TVal *cv = tarr_get(cks, TV_STR(tstr_intern(TEB_SESS_COOKIE,
+                                                    strlen(TEB_SESS_COOKIE))));
+        if (cv && cv->t == T_STR) {
+            TStr *s = (TStr *)cv->u.p;
+            if (teb_sid_valid(tstr_val(s), s->len)) {
+                memcpy(sid, tstr_val(s), TEB_SESS_SID_LEN);
+                for (int i = 0; i < TEB_SESS_SID_LEN; i++)
+                    if (sid[i] >= 'A' && sid[i] <= 'F') sid[i] += 32;
+                have_sid = true;
+            }
+        }
+    }
+
+    /* 读会话数据：sid 合法 → mtime 过期则作废换新；未过期读文件解码。
+     * 读失败/解码失败保留 sid 空数据（自愈，避免 cookie 抖动）。 */
+    TArr *data = tarr_new();
+    if (have_sid) {
+        char path[TEB_SESS_PATH_CAP];
+        if (!teb_sess_path(path, sizeof path, sid)) {
+            tval_release(&(TVal){ .t = T_ARR, .u.p = data });
+            tphp_vm_raise(vm, "Error",
+                          "Tphp\\Teb\\Request::session(): session_save_path"
+                          " too long");
+        }
+        int64_t mt = teb_fs_mtime(path);
+        if (mt >= 0 && (int64_t)time(NULL) - mt > g_teb.session_lifetime) {
+            teb_fs_unlink(path);
+            have_sid = false;              /* 过期 → 全新会话 */
+        } else if (mt >= 0) {
+            char *raw = NULL; size_t rlen = 0;
+            if (teb_read_file_max(path, TEB_SESS_MAX_BYTES, &raw, &rlen) == 0) {
+                TVal dec = TV_NULL;
+                if (rlen > 0 && tphp_json_decode_c(raw, rlen, &dec) &&
+                    dec.t == T_ARR) {
+                    tval_release(&(TVal){ .t = T_ARR, .u.p = data });
+                    data = (TArr *)dec.u.p;   /* decode +1 归本处 */
+                }
+                tm_free(raw);
+            }
+        }
+    }
+    if (!have_sid && !teb_sid_random(sid)) {
+        tval_release(&(TVal){ .t = T_ARR, .u.p = data });
+        tphp_vm_raise(vm, "Error",
+                      "Tphp\\Teb\\Request::session(): CSPRNG unavailable"
+                      " (uv_random failed)");
+    }
+
+    teb_sess_gc();                          /* 节流门内，非每请求全扫 */
+
+    TObj *s = tphp_obj_alloc(g_sess_cls);
+    s->props[0] = TV_STR(tstr_new(sid, TEB_SESS_SID_LEN));
+    s->props[1] = TV_ARR(data);
+    s->props[2] = TV_FALSE;
+
+    teb_set_slot(req, 8, TV_OBJ(s));        /* Request 持 +1（转移） */
+    tval_addref(TV_OBJ(s));                 /* 返回 +1 */
+    /* 正向同步：Stream 已在（先 beginStream 后 session）→ 挂 Stream 槽 */
+    TVal st = req->props[4];
+    if (st.t == T_OBJ && ((TObj *)st.u.p)->cls == g_stream_cls) {
+        TObj *so = (TObj *)st.u.p;
+        so->props[5] = TV_OBJ(s);
+        tval_addref(so->props[5]);
+    }
+    return s;
+}
+
+/* session(): Session —— 惰性打开；同请求幂等缓存（Request props[8]）。
+ * 未调用不产生任何 cookie 与文件 I/O。 */
+static TVal nm_req_session(VM *vm, void *self, TVal *args, int n) {
+    (void)args; (void)n;
+    return TV_OBJ(teb_session_open(vm, (TObj *)self));
+}
+
+/* __construct —— 禁手动 new */
+static TVal nm_sess_construct(VM *vm, void *self, TVal *args, int n) {
+    (void)self; (void)args; (void)n;
+    tphp_vm_raise(vm, "Error",
+                  "Tphp\\Teb\\Session cannot be constructed directly "
+                  "(use Request::session())");
+}
+
+/* id(): string */
+static TVal nm_sess_id(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    if (o->props[0].t != T_STR) return TV_STR(tstr_new("", 0));
+    tval_addref(o->props[0]);
+    return o->props[0];
+}
+
+/* 查找键（get/has/remove 共用）：tarr_* 内部 tval_norm_key 自动把
+ * 数字字符串归一为 int 键，与 set 侧一致。 */
+static TVal sess_key(VM *vm, TVal *args, int n, const char *who) {
+    const char *k = arg_str(vm, args, n, 0, who);
+    return TV_STR(tstr_intern(k, strlen(k)));   /* interned：release no-op */
+}
+
+/* get(string $k, $default = null) */
+static TVal nm_sess_get(VM *vm, void *self, TVal *args, int n) {
+    TObj *o = (TObj *)self;
+    TVal key = sess_key(vm, args, n, "Session::get");
+    if (o->props[1].t == T_ARR) {
+        TVal *v = tarr_get((TArr *)o->props[1].u.p, key);
+        if (v && v->t != T_UNDEF) {
+            tval_addref(*v);
+            return *v;
+        }
+    }
+    if (n >= 2) {
+        TVal d = args[1];
+        tval_addref(d);
+        return d;
+    }
+    return TV_NULL;
+}
+
+/* set(string $k, $v): self —— 顶层值白名单（null/bool/int/float/string/
+ * array）；destroyed 后 set → 换新 sid 复活（防会话固定）。 */
+static TVal nm_sess_set(VM *vm, void *self, TVal *args, int n) {
+    TObj *o = (TObj *)self;
+    TVal key = sess_key(vm, args, n, "Session::set");
+    if (n < 2)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Session::set() expects at least 2 arguments");
+    TVal val = args[1];
+    if (val.t != T_NULL && val.t != T_FALSE && val.t != T_TRUE &&
+        val.t != T_INT && val.t != T_FLOAT && val.t != T_STR &&
+        val.t != T_ARR)
+        tphp_vm_raise(vm, "TypeError",
+                      "Session::set(): value must be null/bool/int/float/"
+                      "string/array (objects and closures cannot be"
+                      " session-encoded)");
+    if (o->props[2].t == T_TRUE) {          /* destroyed → 复活换新 sid */
+        char sid[TEB_SESS_SID_LEN + 1];
+        if (!teb_sid_random(sid))
+            tphp_vm_raise(vm, "Error",
+                          "Tphp\\Teb\\Session::set(): CSPRNG unavailable");
+        TVal ns = TV_STR(tstr_new(sid, TEB_SESS_SID_LEN));
+        teb_set_slot(o, 0, ns);
+        o->props[2] = TV_FALSE;
+    }
+    if (o->props[1].t != T_ARR)
+        teb_set_slot(o, 1, TV_ARR(tarr_new()));
+    TArr *data = (TArr *)o->props[1].u.p;   /* 恒 rc=1：all() 返回副本 */
+    tval_addref(val);                       /* tarr_set 转移 val 所有权 */
+    tarr_set(data, key, val);
+    tval_release(&key);
+    tval_addref(TV_OBJ(o));
+    return TV_OBJ(o);
+}
+
+/* has(string $k): bool */
+static TVal nm_sess_has(VM *vm, void *self, TVal *args, int n) {
+    TObj *o = (TObj *)self;
+    TVal key = sess_key(vm, args, n, "Session::has");
+    bool r = (o->props[1].t == T_ARR) &&
+             tarr_has((TArr *)o->props[1].u.p, key);
+    tval_release(&key);
+    return r ? TV_TRUE : TV_FALSE;
+}
+
+/* remove(string $k): self */
+static TVal nm_sess_remove(VM *vm, void *self, TVal *args, int n) {
+    TObj *o = (TObj *)self;
+    TVal key = sess_key(vm, args, n, "Session::remove");
+    if (o->props[1].t == T_ARR)
+        tarr_unset((TArr *)o->props[1].u.p, key);
+    tval_release(&key);
+    tval_addref(TV_OBJ(o));
+    return TV_OBJ(o);
+}
+
+/* all(): array —— 新建副本（data 恒 rc=1，set/remove 免 COW 纪律） */
+static TVal nm_sess_all(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    TArr *out = tarr_new();
+    if (o->props[1].t == T_ARR) {
+        TArr *src = (TArr *)o->props[1].u.p;
+        tarr_sync_buckets(src);
+        for (uint32_t b = 0; b < src->bcap; b++) {
+            ABucket *bk = &src->buckets[b];
+            if (bk->key.t == T_NULL || bk->val_off == UINT32_MAX) continue;
+            TVal k = bk->key, v = src->data[bk->val_off];
+            tval_addref(k);
+            tval_addref(v);
+            tarr_set(out, k, v);         /* 复制成对自持引用 */
+            tval_release(&k);
+            tval_release(&v);
+        }
+    }
+    return TV_ARR(out);
+}
+
+/* destroy(): void —— 删文件 + 清数据 + 置 destroyed（响应注入清除 cookie） */
+static TVal nm_sess_destroy(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    TStr *id = (o->props[0].t == T_STR) ? (TStr *)o->props[0].u.p : NULL;
+    if (id && o->props[2].t != T_TRUE) {
+        char path[TEB_SESS_PATH_CAP];
+        if (teb_sess_path(path, sizeof path, tstr_val(id)))
+            teb_fs_unlink(path);
+    }
+    if (o->props[1].t != T_ARR)
+        teb_set_slot(o, 1, TV_ARR(tarr_new()));
+    else {
+        TArr *empty = tarr_new();
+        teb_set_slot(o, 1, TV_ARR(empty));
+    }
+    o->props[2] = TV_TRUE;
+    return TV_NULL;
+}
+
+/* regenerateId(): self —— 删旧文件 + 新 sid，数据留内存（flush 写新文件） */
+static TVal nm_sess_regenerate(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    if (o->props[2].t != T_TRUE) {
+        TStr *id = (o->props[0].t == T_STR) ? (TStr *)o->props[0].u.p : NULL;
+        if (id) {
+            char path[TEB_SESS_PATH_CAP];
+            if (teb_sess_path(path, sizeof path, tstr_val(id)))
+                teb_fs_unlink(path);
+        }
+    }
+    char sid[TEB_SESS_SID_LEN + 1];
+    if (!teb_sid_random(sid))
+        tphp_vm_raise(vm, "Error",
+                      "Tphp\\Teb\\Session::regenerateId(): CSPRNG unavailable");
+    teb_set_slot(o, 0, TV_STR(tstr_new(sid, TEB_SESS_SID_LEN)));
+    o->props[2] = TV_FALSE;
+    tval_addref(TV_OBJ(o));
+    return TV_OBJ(o);
+}
+
 /* ---- Tphp\Teb\Stream 原生方法（doc/API.md Stream 节）----
- * props: 0=conn 1=status 2=headers 3=header_sent 4=ended */
+ * props: 0=conn 1=status 2=headers 3=header_sent 4=ended 5=session */
 
 static TVal nm_stream_construct(VM *vm, void *self, TVal *args, int n) {
     (void)self; (void)args; (void)n;
@@ -2746,7 +3411,7 @@ static void teb_register_classes(void) {
     g_web_cls = w;
 
     /* Request：props 0=conn 1=info 2=form_cache 3=files_cache 4=stream_obj
-     *          5=body_cache 6=qp_cache 7=cookie_cache */
+     *          5=body_cache 6=qp_cache 7=cookie_cache 8=session */
     TClass *rq = teb_cls_new("Tphp\\Teb\\Request");
     teb_cls_add_prop(rq, "conn");
     teb_cls_add_prop(rq, "info");
@@ -2756,6 +3421,7 @@ static void teb_register_classes(void) {
     teb_cls_add_prop(rq, "body_cache");
     teb_cls_add_prop(rq, "qp_cache");
     teb_cls_add_prop(rq, "cookie_cache");
+    teb_cls_add_prop(rq, "session");
     teb_cls_add_ctor(rq, (void *)nm_req_construct);
     teb_cls_add_native(rq, "method", (void *)nm_req_method, false);
     teb_cls_add_native(rq, "uri", (void *)nm_req_uri, false);
@@ -2781,6 +3447,7 @@ static void teb_register_classes(void) {
     teb_cls_add_native(rq, "form", (void *)nm_req_form, false);
     teb_cls_add_native(rq, "file", (void *)nm_req_file, false);
     teb_cls_add_native(rq, "files", (void *)nm_req_files, false);
+    teb_cls_add_native(rq, "session", (void *)nm_req_session, false);
     tphp_class_register_compile(rq);
     g_req_cls = rq;
 
@@ -2804,13 +3471,14 @@ static void teb_register_classes(void) {
     tphp_class_register_compile(rp);
     g_resp_cls = rp;
 
-    /* Stream：props 0=conn 1=status 2=headers 3=header_sent 4=ended */
+    /* Stream：props 0=conn 1=status 2=headers 3=header_sent 4=ended 5=session */
     TClass *st = teb_cls_new("Tphp\\Teb\\Stream");
     teb_cls_add_prop(st, "conn");
     teb_cls_add_prop(st, "status");
     teb_cls_add_prop(st, "headers");
     teb_cls_add_prop(st, "header_sent");
     teb_cls_add_prop(st, "ended");
+    teb_cls_add_prop(st, "session");
     teb_cls_add_ctor(st, (void *)nm_stream_construct);
     teb_cls_add_native(st, "status", (void *)nm_stream_status, false);
     teb_cls_add_native(st, "header", (void *)nm_stream_header, false);
@@ -2849,6 +3517,23 @@ static void teb_register_classes(void) {
     teb_cls_add_native(ws, "remoteAddr", (void *)nm_ws_remote_addr, false);
     tphp_class_register_compile(ws);
     g_ws_cls = ws;
+
+    /* Session：props 0=id 1=data 2=destroyed（不可手动 new，见 nm_sess_construct） */
+    TClass *ss = teb_cls_new("Tphp\\Teb\\Session");
+    teb_cls_add_prop(ss, "id");
+    teb_cls_add_prop(ss, "data");
+    teb_cls_add_prop(ss, "destroyed");
+    teb_cls_add_ctor(ss, (void *)nm_sess_construct);
+    teb_cls_add_native(ss, "id", (void *)nm_sess_id, false);
+    teb_cls_add_native(ss, "get", (void *)nm_sess_get, false);
+    teb_cls_add_native(ss, "set", (void *)nm_sess_set, false);
+    teb_cls_add_native(ss, "has", (void *)nm_sess_has, false);
+    teb_cls_add_native(ss, "remove", (void *)nm_sess_remove, false);
+    teb_cls_add_native(ss, "all", (void *)nm_sess_all, false);
+    teb_cls_add_native(ss, "destroy", (void *)nm_sess_destroy, false);
+    teb_cls_add_native(ss, "regenerateId", (void *)nm_sess_regenerate, false);
+    tphp_class_register_compile(ss);
+    g_sess_cls = ss;
 }
 
 /* ---- init：被 ext registry 调用，首脚本编译前一次 ---- */
