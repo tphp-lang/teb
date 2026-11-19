@@ -23,6 +23,7 @@ tphp run example/01-routes.php
 | 06-middleware-static.php | 8086 | before 中间件链、静态目录映射、stats |
 | 07-websocket.php | 8087 | WebSocket 聊天室（广播/ping/close） |
 | 08-drain.php | 8088 | drain() 事件泵：自控节奏、定时退出、stats |
+| 09-session.php | 8089 | 会话登录态：session()/读回/计数/regenerateId/destroy + cookie opts |
 
 ## 快速验证
 
@@ -37,6 +38,10 @@ curl http://127.0.0.1:8086/assets/secret.txt     # 被 before 拦 403
 tphp run tests/wsclient.php   # WS 客户端（仓库自带；默认连 8087/ws）
 # WS_PORT=8087 WS_PATH=ws WS_MSG=ping tphp run tests/wsclient.php
 # 08-drain 无需操作，15 秒后自然退出并打印 STATS
+curl -i -c ck.txt http://127.0.0.1:8089/login         # 会话：拿 Set-Cookie
+curl    -b ck.txt http://127.0.0.1:8089/whoami        # 跨请求读回（user=alice）
+curl    -b ck.txt http://127.0.0.1:8089/visits        # 计数持久化（重放看 1→2）
+curl -i -b ck.txt -c ck.txt http://127.0.0.1:8089/logout  # 清 cookie（Max-Age=0）
 ```
 
 ## 常用坑位

@@ -68,7 +68,7 @@ bash tests/run.sh              # 总冒烟：33 项断言，约 40s（请求体�
 bash tests/run_p0.sh           # P0 冒烟：45 项断言（流式/上传/notFound/助手/工厂/stop）
 bash tests/run_p1.sh           # P1 冒烟：30 项断言（before/静态/stats/WS 含帧层）
 bash tests/run_session.sh      # Session/cookie opts 冒烟：33 项断言（会话链/注入/过期/GC）
-bash example/smoke_examples.sh # 示例冒烟：40 项断言
+bash example/smoke_examples.sh # 示例冒烟：49 项断言
 ```
 
 默认使用兄弟目录引擎 `../TinyPHP.rt/build/tphp.exe`，可用 `TPHP_BIN=...` 覆盖。

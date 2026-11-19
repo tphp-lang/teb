@@ -105,6 +105,31 @@ wait_port 8088 && {
   grep -q "drain demo exit" /tmp/teb_ex_08.log && ok drainexit 1 || ok drainexit 0
 } || { echo "  server 08 not up"; FAIL=$((FAIL+1)); kill $SPID 2>/dev/null; }
 
+echo "== 09-session =="
+run_case 09-session.php 8089 && {
+  J=/tmp/teb_ex_ck.txt; rm -f "$J"
+  H=$(curl -s -i -c "$J" http://127.0.0.1:8089/login)
+  echo "$H" | grep -q "Set-Cookie: tphp_sid=" && ok sesscookie 1 || ok sesscookie 0
+  echo "$H" | grep -q "HttpOnly" && ok sesshttponly 1 || ok sesshttponly 0
+  R=$(curl -s -b "$J" http://127.0.0.1:8089/whoami)
+  [ "$R" = "user=alice" ] && ok sesswho 1 || ok "sesswho [$R]" 0
+  R=$(curl -s -b "$J" -c "$J" http://127.0.0.1:8089/visits)
+  [ "$R" = "visits=1" ] && ok sessvisit1 1 || ok "sessvisit1 [$R]" 0
+  R=$(curl -s -b "$J" -c "$J" http://127.0.0.1:8089/visits)
+  [ "$R" = "visits=2" ] && ok sessvisit2 1 || ok "sessvisit2 [$R]" 0
+  R=$(curl -s -b "$J" http://127.0.0.1:8089/regen)
+  echo "$R" | grep -q "user=alice" && ok sessregen 1 || ok "sessregen [$R]" 0
+  H=$(curl -s -i -b "$J" -c "$J" http://127.0.0.1:8089/logout)
+  echo "$H" | grep -q "tphp_sid=; Path=/; HttpOnly" && ok sesslogout 1 || ok sesslogout 0
+  R=$(curl -s -b "$J" http://127.0.0.1:8089/whoami)
+  [ "$R" = "user=-" ] && ok sessafter 1 || ok "sessafter [$R]" 0
+  H=$(curl -s -i http://127.0.0.1:8089/remember)
+  echo "$H" | grep -q "Set-Cookie: remember=1; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax" \
+    && ok sessckopts 1 || ok "sessckopts [$(echo "$H" | grep -i 'Set-Cookie: remember')] " 0
+  kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
+  rm -f "$J"
+}
+
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ $FAIL -eq 0 ]
