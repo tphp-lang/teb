@@ -50,6 +50,12 @@
 - **WS 回调固定主线程**：onOpen/onMessage/onClose 只在主线程执行——跨帧/跨连接的 `global` 状态（如聊天室房间表）与主脚本种子同线程。
 - **同请求内回调恒同线程**：before 链与路由回调在同一次分发里执行，`global` 在请求内传值不受池影响；跨**请求**的 globals/`define`/静态类属性按线程隔离（池线程看不到主脚本种子），跨请求共享状态请用 Session 或文件。
 - **回调闭包跨线程克隆**：池启用时所有路由/中间件/WS 回调在 `start()` 序列化快照（运行期新增的注册在发布时快照），捕获值必须可克隆（对象需 `__cloneState`；内置 `Web` 支持 `use ($web)`），否则 `start()` 抛 `NotCloneableError`。`Request`/`Response`/`Stream`/`Session`/`WebSocket` 对象不跨线程（生命周期恒在处理它的线程内）。
+- **autoload 跨线程边界（批B）**：
+  1. `spl_autoload_register()` 必须在 `start()` **之前**调用——start 一次性序列化快照、池线程首泵导入；start 之后注册/更换**不传播**池线程（主线程仍生效）；
+  2. autoload 回调必须可序列化（同闭包克隆规则），不可序列化时 start 打 warning 且池线程无 autoloader（类 miss 直接 `Error: Class not found`）；
+  3. **start 之后动态加载的类不进池线程**——类表克隆只在池线程启动时发生一次（重复克隆引擎 fatal），推荐**所有类在 start() 前加载完毕**（主脚本编译期类 + start 前 require 的类都会进克隆源）；
+  4. **池线程回调内 `require` 含类声明的文件：串行可用，并发 unsupported**——注册进引擎类表 master 的写入无锁，同名注册已做幂等去重（restart 克隆不会重复 fatal），但**并发** require 仍存在 check-then-put 与编译期静态状态的数据竞态（已知限制 R8，勿在池回调里并发动态加载新类；串行请求下的池内 autoload 按需加载是受支持的形态，见 smoke_pool）；
+  5. **字面量 `new Foo()` 被共享字节码 ic 短路**：首个消费线程 resolve 后 inline cache 缓存类指针，**其余线程执行同一闭包时不再走 resolve/autoload**（ic 属冻结字节码，跨线程共享）；需要「每个线程各自触发 autoload」（如按线程隔离的懒加载统计）请用动态类名 `new $cls()`——`op_new_dyn` 每次解析、无 ic。取证/分支可用 `\Tphp\Teb\Internal::inPoolThread(): bool`（当前线程是否为池线程）。
 - **stop 链**：池回调内 `$web->stop()` 只置信号，由主线程 `run()`/`drain()` 轮询后统一执行真停（shutdown → join 池 → 停服务器 → 释放配置）；主线程回调内 stop 语义与旧版相同（draining 中挂 pending_stop，批末真停）。
 
 ### `class` 类名 `Request`

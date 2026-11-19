@@ -240,6 +240,8 @@ typedef struct {
     int n_share;
     char *const_blob;           /* 用户常量快照（start 捕获，池首泵导入，stop 释放） */
     uint32_t const_blob_len;
+    char *autoload_blob;        /* autoload 回调快照（批B；start 捕获，池首泵导入） */
+    uint32_t autoload_blob_len;
     TVal web_obj;              /* 运行中 Web 对象（+1；real_stop 释放） */
     char upload_tmp_dir[400];  /* 上传 tmp 目录（start 自留键；缺省系统 tmp） */
     int64_t upload_max_bytes;  /* 上传/单字段累计上限（缺省 64M） */
@@ -267,6 +269,7 @@ static Program *g_pump_prog;   /* 泵 Program（main 编译一次，进程级只
 /* 池线程专属（主线程恒 false/空；_Thread_local 天然隔离） */
 static _Thread_local bool g_in_pool_thread = false;
 static _Thread_local bool g_consts_imported = false;
+static _Thread_local bool g_autoload_imported = false;   /* 批B */
 typedef struct { const void *key; uint64_t gen; TVal local; } TebLocalCb;
 static _Thread_local TebLocalCb *g_local_cbs = NULL;
 static _Thread_local int g_local_n = 0, g_local_cap = 0;
@@ -1621,6 +1624,11 @@ static void teb_real_stop(void) {
     g_teb.n_share = 0;
     if (g_teb.const_blob) { tm_free(g_teb.const_blob); g_teb.const_blob = NULL; }
     g_teb.const_blob_len = 0;
+    if (g_teb.autoload_blob) {
+        tm_free(g_teb.autoload_blob);
+        g_teb.autoload_blob = NULL;
+    }
+    g_teb.autoload_blob_len = 0;
     g_teb.pools_armed = false;
 }
 
@@ -2201,6 +2209,13 @@ static void teb_import_consts(VM *vm) {
     }
 }
 
+/* Internal::inPoolThread(): bool —— 当前线程是否为执行池线程（TLS 判定；
+ * 回调内可用于分支/取证，如 autoload 快照在池线程生效的标记）。 */
+static TVal nm_internal_in_pool_thread(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)self; (void)args; (void)n;
+    return g_in_pool_thread ? TV_TRUE : TV_FALSE;
+}
+
 /* \Tphp\Teb\Internal\pump(): bool —— 池泵体。shutdown/ctx 失效 → false
  * （pump 循环退出 → run_closure 返回 → 线程收尾）。
  * 泵只消费 HTTP 节点（teb_drain_mode mode=1）：WS 回调固定主线程。 */
@@ -2208,6 +2223,20 @@ static TVal nm_pool_pump(VM *vm, void *self, TVal *args, int n) {
     (void)self; (void)args; (void)n;
     if (!g_teb.ctx || g_teb.shutdown) return TV_FALSE;
     teb_import_consts(vm);
+    /* 批B：autoload 导入（与 consts 同语义位：start 快照 → 池首泵导入；
+     * setter 内部 addref（class.c），unserialize 的 +1 由本处 release） */
+    if (!g_autoload_imported && g_teb.autoload_blob) {
+        g_autoload_imported = true;
+        TVal v = TV_NULL;
+        if (tphp_unserialize_val(NULL, g_teb.autoload_blob,
+                                 g_teb.autoload_blob_len, &v)) {
+            tphp_class_set_autoload_val(v);
+            tval_release(&v);
+        } else {
+            tphp_warn("PHP Warning: Teb autoload snapshot import failed in"
+                      " pool thread\n");
+        }
+    }
     teb_drain_mode(vm, 1);
     return TV_TRUE;
 }
@@ -2329,6 +2358,26 @@ static char *teb_const_snapshot(uint32_t *out_len) {
         tval_release(&(TVal){ .t = T_STR, .u.p = vs });
     }
     *out_len = (uint32_t)len;
+    return b;
+}
+
+/* 批B：autoload 回调快照（start 主线程；未注册返 NULL、不可序列化
+ * warn+NULL——池线程无 autoloader 时类 miss 直接 Error，见 API.md 边界）。 */
+static char *teb_autoload_snapshot(uint32_t *out_len) {
+    *out_len = 0;
+    TVal f = tphp_class_get_autoload_val();   /* 引擎 getter：+1 副本 */
+    if (f.t == T_NULL) return NULL;
+    TStr *s = tphp_serialize_val((VM *)tphp_vm_current, f);
+    tval_release(&f);
+    if (!s) {
+        tphp_warn("PHP Warning: Teb spl_autoload callback is not serializable;"
+                  " pool threads will have no autoloader\n");
+        return NULL;
+    }
+    char *b = tm_malloc(s->len ? s->len : 1);
+    memcpy(b, tstr_val(s), s->len);
+    *out_len = (uint32_t)s->len;
+    tval_release(&(TVal){ .t = T_STR, .u.p = s });
     return b;
 }
 
@@ -2647,6 +2696,10 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
                     g_teb.share[g_teb.n_share++] = mvm->inc_progs[i];
             }
             g_teb.const_blob = teb_const_snapshot(&g_teb.const_blob_len);
+            /* 批B：autoload 回调快照（未注册/不可序列化 → NULL+warn，
+             * 池线程无 autoloader = 类 miss 直接 Error——见 API.md 边界） */
+            g_teb.autoload_blob =
+                teb_autoload_snapshot(&g_teb.autoload_blob_len);
             /* 既有配置回填（start 前注册的路由/before/nf/ws） */
             teb_backfill_blobs();
             g_teb.pools_armed = true;
@@ -4563,6 +4616,7 @@ static void teb_register_classes(void) {
      * 调用目标；native static，self=NULL。仅此一个方法，无 ctor/props） */
     TClass *it = teb_cls_new("Tphp\\Teb\\Internal");
     teb_cls_add_native(it, "pump", (void *)nm_pool_pump, true);
+    teb_cls_add_native(it, "inPoolThread", (void *)nm_internal_in_pool_thread, true);
     tphp_class_register_compile(it);
 }
 

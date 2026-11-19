@@ -84,6 +84,29 @@ if wait_ready "$BASE/ok" 15; then
     wait $inc_pids   # 显式 PID：裸 wait 会连后台服务器一起等（死锁）
     val=$(curlp -H "Cookie: tphp_sid=$sid" "$BASE/sess-val")
     check "concurrent same-session writes lose nothing" "n=8" "$val"
+
+    # ---- 批B：池内 autoload（串行发——防并发 require 撞 master 无锁竞态 R8）。
+    # 每个消费者线程首 miss 各走一次 autoload 快照（类表按线程隔离；动态
+    # new 绕共享 ic，字面量 new 会被首个消费者的 ic 快路短路掉后续线程的
+    # resolve）→ 断言：池线程至少跑过 1 次（-pool 标记，证快照导入生效）+
+    # 跨线程合计 ≥2（证类表/快照按线程各自生效）。 ----
+    lazyfail=0
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        [ "$(curlp "$BASE/lazy")" = "lazy-ok" ] || lazyfail=$((lazyfail + 1))
+    done
+    check "pool lazy-class loads (20 requests)" "0" "$lazyfail"
+    autoload_pool=$(grep -c "auto-loaded-pool" "$LOG" 2>/dev/null)
+    if [ "${autoload_pool:-0}" -ge 1 ]; then
+        check "autoload snapshot runs in pool thread" "ok" "ok"
+    else
+        check "autoload snapshot runs in pool thread" ">=1" "${autoload_pool:-0}"
+    fi
+    autoload_n=$(grep -c "auto-loaded" "$LOG" 2>/dev/null)
+    if [ "${autoload_n:-0}" -ge 2 ]; then
+        check "autoload ran across threads" "ok" "ok"
+    else
+        check "autoload ran across threads" ">=2" "${autoload_n:-0}"
+    fi
 else
     check "server ready" "ready" "timeout"
 fi

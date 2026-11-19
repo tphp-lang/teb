@@ -38,7 +38,27 @@ function register_routes($web) {
 }
 
 $web = new Web();
+
+// 批B：spl_autoload_register 必须在 start() 前（start 一次性快照给池线程）。
+// autoloader echo 线程标记——「-pool」证快照在池线程真实执行，跨线程合计
+// ≥2 证每个消费者线程各自首 miss 各跑一次（类表按线程隔离 + 动态 new
+// 绕开共享字节码 ic 快路，字面量 new 首个消费者填 ic 后其余线程不再
+// resolve）；类不可被主脚本提前使用（否则编译期进 master 测不到池路径）。
+spl_autoload_register(function (string $cls) {
+    if ($cls === "PoolLazyCls") {
+        echo (\Tphp\Teb\Internal::inPoolThread() ? "auto-loaded-pool"
+                                                 : "auto-loaded-main") . "\n";
+        require __DIR__ . "/_pool_lazy_cls.php";
+    }
+});
+
 register_routes($web);
+// 懒加载路由：池回调里动态 new 未加载类 → class miss → autoload 快照
+$web->route("/lazy", function (Request $r): Response {
+    $cls = "PoolLazyCls";
+    $o = new $cls();
+    return new Response($o->tag());
+});
 $web->start([
     "listening_ports" => "18135",
     "num_threads" => "8",
@@ -52,6 +72,11 @@ echo "run1-done\n";
 // restart×3：stop 清路由 → 重新注册 → 新池（类表克隆/闭包副本重建）
 for ($i = 1; $i <= 3; $i++) {
     register_routes($web);
+    $web->route("/lazy", function (Request $r): Response {
+        $cls = "PoolLazyCls";
+        $o = new $cls();
+        return new Response($o->tag());
+    });
     $web->start([
         "listening_ports" => "18135",
         "num_threads" => "8",

@@ -69,7 +69,7 @@ bash tests/run_p0.sh           # P0 冒烟：45 项断言（流式/上传/notFou
 bash tests/run_p1.sh           # P1 冒烟：30 项断言（before/静态/stats/WS 含帧层）
 bash tests/run_session.sh      # Session/cookie opts 冒烟：33 项断言（会话链/注入/过期/GC）
 bash tests/run_route2.sh       # 路由批A 冒烟：19 项断言（{param}/方法分发/405/五档优先级）
-bash tests/run_pool.sh         # 执行池冒烟：11 项断言（并行度/同会话并发写/池 stop/restart×3）
+bash tests/run_pool.sh         # 执行池冒烟：14 项断言（并行度/同会话并发写/池内 autoload 快照/池 stop/restart×3）
 bash example/smoke_examples.sh # 示例冒烟：49 项断言
 ```
 
