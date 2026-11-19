@@ -9,7 +9,8 @@
 | 方法名 | 参数 | 返回值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `__construct` | - | - | 创建服务器实例 |
-| `route` | `string` `$uri` 路由路径 <br> `callable` `$cb` 回调 `function (Request $r): Response` | self | 注册路由，start 前后均可；stop 清空路由表，重启后需重新注册 |
+| `route` | `string` `$uri` 路由路径 <br> `callable` `$cb` 回调 `function (Request $r): Response` | self | 注册路由（**任意方法**），start 前后均可；stop 清空路由表，重启后需重新注册 |
+| `get` / `post` / `put` / `patch` / `delete` / `head` / `options` | 同 `route` | self | **方法快捷注册**（批A）：仅响应对应 HTTP 方法；同路径可共存多个方法路由；路径匹配但方法全不符 → `405 Method Not Allowed`（带 `Allow` 头，先于 notFound，不进回调）。`$uri` 支持 `/user/{id}` 路径模板（参数经 `Request::routeParam()` 读取，规则见 README 路由匹配节）；非法模板抛 `ValueError` |
 | `notFound` | `callable` `$cb` 回调 | self | 未命中回调（单条，重复调用替换）；注册后覆盖静态回退与最长兜底；Request 的 `uri()` 为原始未匹配路径 |
 | `before` | `callable` `$cb` 中间件 `function (Request $r)` | self | 全局中间件按注册序执行：返回 `null` 继续、`Response` 短路、其他返回值或异常 → 500；可拦静态文件；内可 `beginStream()` 走流式契约 |
 | `file` | `string` `$uriPrefix` URI 前缀 <br> `string` `$dir` 目录 | self | 静态目录映射（可多条）；匹配在路由之后、nf/兜底之前；rest 逐段拒绝 `..`；目录取 index.html；缺失 fallthrough 不遮蔽 nf/兜底 |
@@ -70,6 +71,8 @@
 | `httpVersion` | - | string | HTTP 版本（`"1.1"` 等） |
 | `queryParams` | - | array | query string 解析为关联数组（urlencoded，后值覆盖前值；结果缓存） |
 | `queryParam` | `string` `$k` 键 <br> `mixed` `$default` = null 缺省值 | mixed | 单个 query 参数，缺失返回 `$default` |
+| `routeParams` | - | array | 路径模板参数关联数组（批A；值已 URL 解码；非模板路由/无参数返回 `[]`；结果缓存） |
+| `routeParam` | `string` `$k` 参数名 <br> `mixed` `$default` = null 缺省值 | mixed | 单个路径模板参数（如 `/user/{id}` 的 `id`），缺失返回 `$default` |
 | `cookies` | - | array | 解析 `Cookie` 头（`k=v; k2=v2`；结果缓存） |
 | `cookie` | `string` `$k` 键 <br> `mixed` `$default` = null 缺省值 | mixed | 单个 cookie，缺失返回 `$default` |
 | `json` | `mixed` `$default` = null 缺省值 | mixed | body 按 JSON 解析（引擎 C 层 decode）；坏 JSON / 空 body 返回 `$default`；body 超限抛 `Error`（同 `body()`） |

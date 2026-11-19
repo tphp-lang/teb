@@ -68,6 +68,7 @@ bash tests/run.sh              # 总冒烟：36 项断言，约 40s（路由/请
 bash tests/run_p0.sh           # P0 冒烟：45 项断言（流式/上传/notFound/助手/工厂/stop）
 bash tests/run_p1.sh           # P1 冒烟：30 项断言（before/静态/stats/WS 含帧层）
 bash tests/run_session.sh      # Session/cookie opts 冒烟：33 项断言（会话链/注入/过期/GC）
+bash tests/run_route2.sh       # 路由批A 冒烟：19 项断言（{param}/方法分发/405/五档优先级）
 bash tests/run_pool.sh         # 执行池冒烟：11 项断言（并行度/同会话并发写/池 stop/restart×3）
 bash example/smoke_examples.sh # 示例冒烟：49 项断言
 ```
@@ -138,11 +139,15 @@ gzip 在 Linux/macOS 使用系统 zlib；Windows 默认不启用（避免引入�
 
 ## 路由匹配规则（按优先级）
 
-1. **精确匹配**：`"/hello"` 只匹配 `/hello`；
-2. **前缀匹配**：`"/hello"` 匹配 `/hello/xxx`；
-3. **notFound**：注册了 `notFound()` 时，未命中 1/2 的请求进 notFound 回调（**覆盖静态回退与兜底**）；
-4. 无 notFound 时取最长注册路由（fallback）；
-5. 全无命中交回 civetweb 默认处理（静态文件/404）。
+1. **精确匹配**：`"/hello"` 只匹配 `/hello`（纯字面量注册）；
+2. **路径模板匹配**：`"/user/{id}"` 段级全匹配——段数相等、`{name}` 捕获单段（`[A-Za-z_][A-Za-z0-9_]*` 参数名，值自动 URL 解码，经 `routeParam()`/`routeParams()` 读取）；字面段逐字节相等；模板不参与前缀档、不匹配多余段（`/user/{id}` 不匹配 `/user/1/posts`）；
+3. **前缀匹配**：`"/hello"` 匹配 `/hello/xxx`（纯字面量注册）；
+4. **方法分发**：`get()/post()/put()/patch()/delete()/head()/options()` 限定方法，`route()` 任意方法；同路径可共存多个方法路由；**路径已匹配但方法全不符 → `405 Method Not Allowed`（带 `Allow` 头，在 notFound/兜底之前，不进回调）**；未知方法（如 PROPFIND）只命中 `route()` 注册；
+5. **notFound**：注册了 `notFound()` 时，1-3 全未命中的请求进 notFound 回调（**覆盖静态回退与兜底**）；
+6. **最长路由兜底**：无 notFound 时取注册 uri 最长的一条（**模板参与**，按原始模板串长度；此档不产路径参数，`routeParam()` 落缺省值）；
+7. 全无命中交回 civetweb 默认处理（静态文件/404）。
+
+字面注册优先于模板（`route("/lit/7")` 胜 `get("/lit/{id}")`）；非法模板（裸花括号/空参数名/重复参数名）在注册时抛 `ValueError`。
 
 回调须返回 `Response` 实例；回调抛异常或返回非 `Response` 时自动回 `500 Internal Server Error`，服务不受影响（异常信息照常打印）。**流式回调例外**：契约见 [doc/API.md](doc/API.md) 的 Stream 节。
 

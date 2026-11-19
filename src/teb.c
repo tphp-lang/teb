@@ -98,13 +98,31 @@ extern bool tphp_vm_call_bounded(struct VM *vm, TVal callable, TVal *args,
 
 /* ---- 全局状态 ---- */
 
+/* 路由方法位掩码（批A：方法分发；0 = 任意方法，route() 即此） */
+#define TEB_M_GET     (1u << 0)
+#define TEB_M_POST    (1u << 1)
+#define TEB_M_PUT     (1u << 2)
+#define TEB_M_PATCH   (1u << 3)
+#define TEB_M_DELETE  (1u << 4)
+#define TEB_M_HEAD    (1u << 5)
+#define TEB_M_OPTIONS (1u << 6)
+
+/* 路径模板段（批A：`/user/{id}` 大括号语法；注册期解析一次，发布后只读） */
+typedef struct {
+    char *text;        /* 字面量内容 / 参数名（不含花括号） */
+    bool is_param;
+} TebSeg;
+
 typedef struct TebRoute {
-    char *uri;
+    char *uri;         /* 原始注册串（模板含 {x}；最长兜底档仍按它 strlen 排序） */
     TVal callable;
     /* 跨线程序列化 blob（pools_enabled 时在发布点生成；池线程据此重建
      * 本地闭包副本——共享 callable 对象绝不跨线程 addref/release） */
     char *cb_blob;
     uint32_t cb_blob_len;
+    uint32_t methods;        /* 方法位掩码，0 = 任意（route()） */
+    TebSeg *segs;            /* 非 NULL = 路径模板；NULL = 纯字面量 */
+    uint8_t n_seg;
     struct TebRoute *next;
 } TebRoute;
 
@@ -157,6 +175,9 @@ typedef struct TebRequest {
     int kind;
     struct mg_connection *conn;
     TebRoute *route;            /* TEQ_REQ：命中路由（nf/兜底也走此） */
+    char **pvals;               /* TEQ_REQ：模板参数值（thunk 匹配产出，
+                                 * 名字借 route->segs；n_pvals=参数段数） */
+    int n_pvals;
     char *path;                 /* TEQ_STATIC：文件路径（thunk 分配，drain 释放） */
     long long path_size;        /* TEQ_STATIC：文件大小（bytes_sent 近似用） */
     TebWsReg *ws_reg;           /* TEQ_WS_*：所属注册 */
@@ -444,49 +465,200 @@ static TArr *teb_parse_urlencoded(const char *s, size_t len) {
 
 /* ---- 路由匹配 ---- */
 
-/* 精确匹配优先 */
-static TebRoute *teb_match_exact(const char *uri) {
-    for (TebRoute *r = g_teb.routes; r; r = r->next)
-        if (strcmp(r->uri, uri) == 0) return r;
-    return NULL;
-}
-
-/* 前缀匹配（"/hello" 命中 "/hello" 与 "/hello/xxx"） */
-static TebRoute *teb_match_prefix(const char *uri) {
-    size_t lu = strlen(uri);
-    for (TebRoute *r = g_teb.routes; r; r = r->next) {
-        size_t lr = strlen(r->uri);
-        if (lr == 0) continue;
-        if (lu >= lr && strncmp(r->uri, uri, lr) == 0 &&
-            (uri[lr] == '/' || uri[lr] == 0))
-            return r;
+/* 模板解析（批A，注册期一次）：uri 须 `/` 开头按 `/` 切段；`{name}` 段的
+ * name 须 [A-Za-z_][A-Za-z0-9_]*。含 `{` 才解析；非法形态 raise ValueError
+ * （raise 前释放全部已建段——**在节点 malloc 之前调用**，注册中止零泄漏）。
+ * 返回 segs（调用方移交节点）；无模板返回 NULL。 */
+static TebSeg *teb_route_parse(const char *uri, int *out_n, VM *vm,
+                               const char *who) {
+    *out_n = 0;
+    if (!uri || uri[0] != '/' || !strchr(uri, '{')) return NULL;
+    const char *p = uri;
+    int cap = 8, n = 0;
+    TebSeg *segs = tm_malloc(sizeof(TebSeg) * (size_t)cap);
+    bool bad = false;
+    while (*p && !bad) {
+        const char *sl = strchr(p, '/');
+        size_t len = sl ? (size_t)(sl - p) : strlen(p);
+        if (len > 0) {                      /* 跳过开头连续 /（uri 已保证 / 开头） */
+            bool is_param = (len >= 2 && p[0] == '{' && p[len - 1] == '}');
+            char *text = tm_malloc(len + 1);
+            if (is_param) {
+                memcpy(text, p + 1, len - 2);
+                text[len - 2] = 0;
+                if (text[0] == 0 ||
+                    !((text[0] >= 'A' && text[0] <= 'Z') ||
+                      (text[0] >= 'a' && text[0] <= 'z') || text[0] == '_'))
+                    bad = true;
+                for (char *c = text; *c && !bad; c++) {
+                    if (!((*c >= '0' && *c <= '9') || (*c >= 'A' && *c <= 'Z') ||
+                          (*c >= 'a' && *c <= 'z') || *c == '_'))
+                        bad = true;
+                }
+            } else {
+                /* 非整段包裹的花括号 = 非法（裸 {、}、a{b 形态） */
+                if (memchr(p, '{', len) || memchr(p, '}', len)) bad = true;
+                memcpy(text, p, len);      /* 字面段内容拷贝（漏拷=seg0 乱码） */
+                text[len] = 0;
+            }
+            if (n == cap) {
+                cap *= 2;
+                segs = tm_realloc(segs, sizeof(TebSeg) * (size_t)cap);
+            }
+            segs[n].text = text;
+            segs[n].is_param = is_param && !bad;
+            n++;
+        }
+        if (!sl) break;
+        p = sl + 1;
     }
-    return NULL;
-}
-
-/* 兜底：返回 URI 最长的一条 */
-static TebRoute *teb_match_longest(void) {
-    TebRoute *best = NULL;
-    size_t best_len = 0;
-    for (TebRoute *r = g_teb.routes; r; r = r->next) {
-        size_t l = strlen(r->uri);
-        if (l > best_len) { best_len = l; best = r; }
+    if (!bad && n > 0) {
+        /* 重复参数名 = 非法 */
+        for (int i = 0; i < n && !bad; i++) {
+            if (!segs[i].is_param) continue;
+            for (int j = i + 1; j < n; j++)
+                if (segs[j].is_param &&
+                    strcmp(segs[i].text, segs[j].text) == 0) bad = true;
+        }
     }
-    return best;
+    if (bad) {
+        for (int i = 0; i < n; i++) tm_free(segs[i].text);
+        tm_free(segs);
+        tphp_vm_raise(vm, "ValueError",
+                      "%s(): invalid route template \"%s\" (expected"
+                      " /seg/{param} with [A-Za-z_][A-Za-z0-9_]* names,"
+                      " no duplicate params)", who, uri);
+        return NULL;   /* raise 不返回 */
+    }
+    *out_n = n;
+    return segs;
 }
 
-/* 匹配顺序（README 路由匹配规则）：精确 → 前缀 → notFound → 最长兜底。
- * 全部落空返回 NULL（thunk 交回 civetweb 默认处理）。
- * 整段在 mu 内（worker 线程匹配 vs 主线程注册并发读写链表）；返回节点
- * 发布后不改不删（生命周期到 stop），锁外使用安全。三个 helper 仅此处调用。 */
-static TebRoute *teb_match_route(const char *uri) {
+/* 批A：方法分发 —— HTTP 方法 → 位（未知方法如 PROPFIND 返 0：与具体
+ * 方法路由不符、与 ANY（methods==0）相容——mbit=0 时 (methods & 0)==0
+ * 恰使具体路由判不符 ✓）。 */
+static uint32_t teb_method_bit(const char *m) {
+    if (!m) return 0;
+    if (str_icmp(m, "GET"))     return TEB_M_GET;
+    if (str_icmp(m, "POST"))    return TEB_M_POST;
+    if (str_icmp(m, "PUT"))     return TEB_M_PUT;
+    if (str_icmp(m, "PATCH"))   return TEB_M_PATCH;
+    if (str_icmp(m, "DELETE"))  return TEB_M_DELETE;
+    if (str_icmp(m, "HEAD"))    return TEB_M_HEAD;
+    if (str_icmp(m, "OPTIONS")) return TEB_M_OPTIONS;
+    return 0;
+}
+
+/* 模板档匹配（T2）：raw uri 按 '/' 切非空段，段数与模板一致逐段相等、
+ * 参数段非空捕获并 urldecode；请求尾部只允许多余空段（"//"或尾"/"）。
+ * 命中时 *out_pvals 装参数段值（数量=参数段数，tm_malloc 移交调用方）。 */
+static bool teb_template_match(TebRoute *r, const char *uri,
+                               char ***out_pvals, int *out_n) {
+    int np = 0;
+    for (int i = 0; i < r->n_seg; i++)
+        if (r->segs[i].is_param) np++;
+    char **pv = tm_malloc(sizeof(char *) * (size_t)(np ? np : 1));
+    int vi = 0;
+    bool ok = true;
+    const char *p = uri;
+    if (*p == '/') p++;
+    for (int i = 0; i < r->n_seg && ok; i++) {
+        while (*p == '/') p++;
+        if (!*p) { ok = false; break; }          /* 请求段不够 */
+        const char *sl = strchr(p, '/');
+        size_t len = sl ? (size_t)(sl - p) : strlen(p);
+        TebSeg *s = &r->segs[i];
+        if (s->is_param) {
+            /* urldecode 输出 ≤ 输入长（%XX 折叠），len+1 缓冲必够 */
+            char *d = tm_malloc(len + 1);
+            int dn = mg_url_decode(p, (int)len, d, (int)len + 1, 1);
+            if (dn < 0) { memcpy(d, p, len); d[len] = 0; }   /* 解码失败回退 raw */
+            pv[vi++] = d;
+        } else {
+            if (len != strlen(s->text) || memcmp(p, s->text, len) != 0)
+                ok = false;
+        }
+        p = sl ? sl + 1 : NULL;
+        if (!p) { p = ""; }
+    }
+    if (ok) {                                    /* 请求须恰好耗尽（余空段可） */
+        while (*p == '/') p++;
+        if (*p) ok = false;
+    }
+    if (!ok) {
+        for (int i = 0; i < vi; i++) tm_free(pv[i]);
+        tm_free(pv);
+        return false;
+    }
+    *out_pvals = pv;
+    *out_n = vi;
+    return true;
+}
+
+/* 匹配结果（批A）：命中路由 + 参数值 + 方法不符证据（405 用） */
+typedef struct {
+    TebRoute *route;       /* 命中（NULL = 未命中或 405） */
+    char **pvals; int n_pvals;   /* 模板参数（移交调用方→req 拥有） */
+    bool method_miss;      /* 有路径匹配候选但方法全不符 → 405 */
+    uint32_t allow;        /* 路径匹配候选的 methods 并集（Allow 头） */
+} TebMatch;
+
+/* 五档匹配（README 路由规则，批A 扩展）：T1 精确字面量 → T2 模板全匹配
+ * → T3 前缀字面量 → （T1-T3 全扫无 HIT 且 method_miss → 405，提前返回）
+ * → T4 notFound → T5 最长兜底（模板参与，无方法门——保「任意未命中 URI
+ * 落最长注册路由」既有契约）。每档扫全档找方法相容候选（后注册优先，
+ * get+post 同路径共存）。整段在 mu 内；节点发布后不改不删，锁外可用。 */
+static void teb_match_route(const char *uri, uint32_t mbit, TebMatch *out) {
+    memset(out, 0, sizeof *out);
     teb_lock();
-    TebRoute *r = teb_match_exact(uri);
-    if (!r) r = teb_match_prefix(uri);
-    if (!r) r = g_teb.nf;
-    if (!r) r = teb_match_longest();
+    /* T1 精确（字面量） */
+    for (TebRoute *r = g_teb.routes; r; r = r->next) {
+        if (r->segs || strcmp(r->uri, uri) != 0) continue;
+        if (r->methods == 0 || (r->methods & mbit)) { out->route = r; goto done; }
+        out->method_miss = true;
+        out->allow |= r->methods;
+    }
+    /* T2 模板全匹配 */
+    for (TebRoute *r = g_teb.routes; r; r = r->next) {
+        if (!r->segs) continue;
+        char **pv = NULL; int nv = 0;
+        if (!teb_template_match(r, uri, &pv, &nv)) continue;
+        if (r->methods == 0 || (r->methods & mbit)) {
+            out->route = r; out->pvals = pv; out->n_pvals = nv;
+            goto done;
+        }
+        for (int i = 0; i < nv; i++) tm_free(pv[i]);
+        tm_free(pv);
+        out->method_miss = true;
+        out->allow |= r->methods;
+    }
+    /* T3 前缀（字面量） */
+    {
+        size_t lu = strlen(uri);
+        for (TebRoute *r = g_teb.routes; r; r = r->next) {
+            if (r->segs) continue;
+            size_t lr = strlen(r->uri);
+            if (lr == 0) continue;
+            if (lu < lr || strncmp(r->uri, uri, lr) != 0 ||
+                (uri[lr] != '/' && uri[lr] != 0)) continue;
+            if (r->methods == 0 || (r->methods & mbit)) { out->route = r; goto done; }
+            out->method_miss = true;
+            out->allow |= r->methods;
+        }
+    }
+    if (out->method_miss) goto done;   /* 路径已知、方法不许 → 405（不落 nf/兜底） */
+    /* T4 notFound */
+    if (g_teb.nf) { out->route = g_teb.nf; goto done; }
+    /* T5 最长兜底（含模板；无方法门） */
+    {
+        size_t best_len = 0;
+        for (TebRoute *r = g_teb.routes; r; r = r->next) {
+            size_t l = strlen(r->uri);
+            if (l > best_len) { best_len = l; out->route = r; }
+        }
+    }
+done:
     uv_mutex_unlock(&g_teb.mu);
-    return r;
 }
 
 /* ---- P1-3 静态文件匹配（thunk 线程调用；纯字符串 + uv 同步 stat） ---- */
@@ -561,6 +733,10 @@ static bool teb_static_match(const char *uri, char **out_path, long long *out_si
 static void teb_req_free(TebRequest *req) {
     if (req->path) tm_free(req->path);
     if (req->ws_data) tm_free(req->ws_data);
+    if (req->pvals) {
+        for (int i = 0; i < req->n_pvals; i++) tm_free(req->pvals[i]);
+        tm_free(req->pvals);
+    }
     tm_free(req);
 }
 
@@ -628,6 +804,33 @@ static void teb_write_413(struct mg_connection *conn) {
     teb_stat_resp(413);
 }
 
+/* ---- 批A：405 方法不符（thunk 入口直写，镜像 413 的入口口径）----
+ * 路径已匹配（T1-T3 有候选）但方法全不符、且无 ANY 路由救场 → 405 + Allow
+ * （Allow = 命中候选 methods 并集）。CL:0 无 body → 保持 keep-alive（handler
+ * 返 1 后 civetweb discard 无事可丢；与 413 的带 body 拒绝不同）。 */
+static const char *TEB_M_NAMES[] = { "GET", "POST", "PUT", "PATCH",
+                                     "DELETE", "HEAD", "OPTIONS" };
+
+static void teb_write_405(struct mg_connection *conn, uint32_t allow) {
+    teb_lock();
+    g_teb.st.requests_total++;   /* 入口拒绝口径与 413 一致 */
+    uv_mutex_unlock(&g_teb.mu);
+    char allow_buf[128];
+    size_t off = 0;
+    for (int i = 0; i < 7 && off < sizeof allow_buf - 16; i++) {
+        if (allow & (1u << i))
+            off += (size_t)snprintf(allow_buf + off, sizeof allow_buf - off,
+                                    off ? ", %s" : "%s", TEB_M_NAMES[i]);
+    }
+    char line[320];
+    int ln = snprintf(line, sizeof line,
+                      "HTTP/1.1 405 Method Not Allowed\r\n"
+                      "Allow: %s\r\nContent-Length: 0\r\n\r\n",
+                      off ? allow_buf : "GET");
+    teb_wr(conn, line, (unsigned long long)ln);
+    teb_stat_resp(405);
+}
+
 /* ---- civetweb request handler thunk（同步阻塞，见文件头） ---- */
 static int teb_req_thunk(struct mg_connection *conn, void *cbdata) {
     (void)cbdata;
@@ -655,17 +858,29 @@ static int teb_req_thunk(struct mg_connection *conn, void *cbdata) {
         req->kind = TEQ_STATIC;
     } else {
         req->kind = TEQ_REQ;
-        req->route = teb_match_route(ri->local_uri_raw);
-        if (!req->route) {   /* 全无命中 → civetweb 默认处理 */
-            tm_free(req);
+        /* 批A：五档匹配（含模板档）+ 方法分发；method_miss → 405（先于
+         * 413 预检：先拒方法再谈 body；未入队不跑 before，入口口径计数） */
+        TebMatch m;
+        teb_match_route(ri->local_uri_raw, teb_method_bit(ri->request_method),
+                        &m);
+        if (!m.route) {
+            if (m.method_miss) {
+                teb_write_405(conn, m.allow);
+                tm_free(req);
+                return 1;
+            }
+            tm_free(req);   /* 全无命中 → civetweb 默认处理 */
             return 0;
         }
+        req->route = m.route;
+        req->pvals = m.pvals;
+        req->n_pvals = m.n_pvals;
         /* body 超限预检：声明的 Content-Length 已超上限且非 multipart →
          * 413 提前拒绝，省掉无意义的请求体传输（multipart 保留 error=1 语义） */
         if (ri->content_length > g_teb.upload_max_bytes &&
             !ri_is_multipart(ri)) {
             teb_write_413(conn);
-            tm_free(req);
+            teb_req_free(req);   /* 含 pvals */
             return 1;
         }
     }
@@ -794,7 +1009,7 @@ static void teb_cls_add_prop(TClass *cls, const char *name) {
 
 /* ---- 请求信息物化（回调进入时一次性缓存进 Request::$info） ---- */
 
-static TArr *teb_req_info_arr(struct mg_connection *conn) {
+static TArr *teb_req_info_arr(struct mg_connection *conn, TebRequest *q) {
     const struct mg_request_info *ri = mg_get_request_info(conn);
     TArr *a = tarr_new();
     if (!ri) return a;
@@ -846,6 +1061,28 @@ static TArr *teb_req_info_arr(struct mg_connection *conn) {
                                  h->value ? strlen(h->value) : 0)));
     }
     tarr_set(a, TV_STR(tstr_intern("headers", 7)), TV_ARR(hdrs));
+
+    /* 批A：路径模板参数 → "params" 键（assoc：参数名 → urldecode 值；
+     * 名字借 route->segs 的 is_param 段，值在 pvals 按 param 序） */
+    if (q && q->kind == TEQ_REQ && q->route && q->route->n_seg &&
+        q->pvals) {
+        TArr *pa = tarr_new();
+        int vi = 0;
+        for (int i = 0; i < q->route->n_seg; i++) {
+            if (!q->route->segs[i].is_param) continue;
+            const char *pn = q->route->segs[i].text;
+            TVal k = TV_STR(tstr_intern(pn, strlen(pn)));
+            const char *v = (vi < q->n_pvals && q->pvals[vi])
+                                ? q->pvals[vi] : "";
+            TVal v2 = TV_STR(tstr_new(v, strlen(v)));
+            tarr_set(pa, k, v2);
+            tval_release(&k);
+            vi++;
+        }
+        TVal pk = TV_STR(tstr_intern("params", 6));
+        tarr_set(a, pk, TV_ARR(pa));
+        tval_release(&pk);
+    }
     return a;
 }
 
@@ -1307,6 +1544,10 @@ static void teb_real_stop(void) {
         TebRoute *nx = r->next;
         if (r->uri) tm_free(r->uri);
         if (r->cb_blob) tm_free(r->cb_blob);
+        if (r->segs) {
+            for (int i = 0; i < r->n_seg; i++) tm_free(r->segs[i].text);
+            tm_free(r->segs);
+        }
         tval_release(&r->callable);
         tm_free(r);
         r = nx;
@@ -1738,7 +1979,7 @@ static void teb_drain_mode(VM *vm, int mode) {
              *        5=body_cache 6=qp_cache 7=cookie_cache 8=session */
             TObj *req = tphp_obj_alloc(g_req_cls);
             req->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
-            req->props[1] = TV_ARR(teb_req_info_arr(q->conn));
+            req->props[1] = TV_ARR(teb_req_info_arr(q->conn, q));
             TVal argv = TV_OBJ(req);
             bool ok = teb_dispatch(vm, req, q->conn,
                                    q->kind == TEQ_REQ ? q->route : NULL,
@@ -1793,7 +2034,7 @@ static void teb_drain_mode(VM *vm, int mode) {
             /* on_open(WebSocket $s, Request $r)——返回值忽略；异常打印忽略 */
             TObj *rq = tphp_obj_alloc(g_req_cls);
             rq->props[0] = TV_INT((int64_t)(uintptr_t)q->conn);
-            rq->props[1] = TV_ARR(teb_req_info_arr(q->conn));
+            rq->props[1] = TV_ARR(teb_req_info_arr(q->conn, q));
             TVal args2[2] = { TV_OBJ(s), TV_OBJ(rq) };
             TVal out = TV_NULL;
             TVal ocb = teb_cb_acquire(vm, &reg->on_open, reg->on_open,
@@ -2112,20 +2353,24 @@ static void teb_backfill_blobs(void) {
 
 /* ---- Tphp\Teb\Web 原生方法 ---- */
 
-/* route(string $uri, callable $cb): self —— start 前后均可注册 */
-static TVal nm_web_route(VM *vm, void *self, TVal *args, int n) {
-    (void)self;
-    const char *uri = arg_str(vm, args, n, 0, "Web::route");
+/* 统一注册入口（批A，镜像 webman addRoute 先例）：route() 走 mask=0（任意
+ * 方法），7 个方法快捷走各自位。模板解析在节点 malloc 前（raise 零泄漏）。 */
+static TVal teb_route_add(VM *vm, void *self, const char *who,
+                          TVal *args, int n, uint32_t mask) {
+    const char *uri = arg_str(vm, args, n, 0, who);
     if (n < 2)
         tphp_vm_raise(vm, "ArgumentCountError",
-                      "Web::route() expects (string, callable)");
+                      "%s() expects (string, callable)", who);
     TVal cb = args[1];
     switch (cb.t) {
     case T_CLOSURE: case T_OBJ: case T_ARR: case T_STR: break;
     default:
         tphp_vm_raise(vm, "TypeError",
-                      "Web::route(): callable expected as argument 2");
+                      "%s(): callable expected as argument 2", who);
     }
+
+    int n_seg = 0;
+    TebSeg *segs = teb_route_parse(uri, &n_seg, vm, who);   /* 非法 → raise */
 
     TebRoute *r = tm_malloc(sizeof *r);
     r->uri = teb_dup(uri);
@@ -2133,6 +2378,9 @@ static TVal nm_web_route(VM *vm, void *self, TVal *args, int n) {
     tval_addref(cb);
     r->cb_blob = NULL;
     r->cb_blob_len = 0;
+    r->methods = mask;
+    r->segs = segs;
+    r->n_seg = (uint8_t)n_seg;
     if (g_teb.pools_armed)   /* 池启用：发布点快照（可能 raise——须在锁外） */
         teb_snapshot_cb(cb, &r->cb_blob, &r->cb_blob_len);
     teb_lock();                 /* 发布：thunk 匹配在 worker 线程读链表 */
@@ -2142,6 +2390,34 @@ static TVal nm_web_route(VM *vm, void *self, TVal *args, int n) {
     uv_mutex_unlock(&g_teb.mu);
     tval_addref(TV_OBJ((TObj *)self));
     return TV_OBJ((TObj *)self);
+}
+
+/* route(string $uri, callable $cb): self —— 任意方法；start 前后均可注册 */
+static TVal nm_web_route(VM *vm, void *self, TVal *args, int n) {
+    return teb_route_add(vm, self, "Web::route", args, n, 0);
+}
+
+/* 方法快捷注册（批A）：get/post/put/patch/delete/head/options 同款链式 self */
+static TVal nm_web_get(VM *vm, void *self, TVal *args, int n) {
+    return teb_route_add(vm, self, "Web::get", args, n, TEB_M_GET);
+}
+static TVal nm_web_post(VM *vm, void *self, TVal *args, int n) {
+    return teb_route_add(vm, self, "Web::post", args, n, TEB_M_POST);
+}
+static TVal nm_web_put(VM *vm, void *self, TVal *args, int n) {
+    return teb_route_add(vm, self, "Web::put", args, n, TEB_M_PUT);
+}
+static TVal nm_web_patch(VM *vm, void *self, TVal *args, int n) {
+    return teb_route_add(vm, self, "Web::patch", args, n, TEB_M_PATCH);
+}
+static TVal nm_web_delete(VM *vm, void *self, TVal *args, int n) {
+    return teb_route_add(vm, self, "Web::delete", args, n, TEB_M_DELETE);
+}
+static TVal nm_web_head(VM *vm, void *self, TVal *args, int n) {
+    return teb_route_add(vm, self, "Web::head", args, n, TEB_M_HEAD);
+}
+static TVal nm_web_options(VM *vm, void *self, TVal *args, int n) {
+    return teb_route_add(vm, self, "Web::options", args, n, TEB_M_OPTIONS);
 }
 
 /* notFound(callable $cb): self —— 无路由命中时的回调；单条，重复调用替换。
@@ -2166,6 +2442,9 @@ static TVal nm_web_not_found(VM *vm, void *self, TVal *args, int n) {
     r->next = NULL;
     r->cb_blob = NULL;
     r->cb_blob_len = 0;
+    r->methods = 0;
+    r->segs = NULL;
+    r->n_seg = 0;
     if (g_teb.pools_armed)
         teb_snapshot_cb(cb, &r->cb_blob, &r->cb_blob_len);
     teb_lock();
@@ -2476,6 +2755,9 @@ static TVal nm_web_before(VM *vm, void *self, TVal *args, int n) {
     b->next = NULL;
     b->cb_blob = NULL;
     b->cb_blob_len = 0;
+    b->methods = 0;
+    b->segs = NULL;
+    b->n_seg = 0;
     if (g_teb.pools_armed)
         teb_snapshot_cb(cb, &b->cb_blob, &b->cb_blob_len);
     teb_lock();
@@ -2751,6 +3033,39 @@ static TVal nm_req_query_param(VM *vm, void *self, TVal *args, int n) {
     if (v && v->t != T_UNDEF && v->t != T_NULL) {
         tval_addref(*v);
         return *v;
+    }
+    if (n >= 2) {
+        TVal d = args[1];
+        tval_addref(d);
+        return d;
+    }
+    return TV_NULL;
+}
+
+/* routeParams(): array —— 路径模板参数（批A；无参数/非模板路由 → []） */
+static TVal nm_req_route_params(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    TVal pv = teb_info_get(o, "params");
+    if (pv.t == T_ARR) {
+        tval_addref(pv);
+        return pv;
+    }
+    return TV_ARR(tarr_new());
+}
+
+/* routeParam(string $k, $default = null) —— 对称 queryParam 命名族 */
+static TVal nm_req_route_param(VM *vm, void *self, TVal *args, int n) {
+    (void)vm;
+    const char *k = arg_str(vm, args, n, 0, "Request::routeParam");
+    TObj *o = (TObj *)self;
+    TVal pv = teb_info_get(o, "params");
+    if (pv.t == T_ARR) {
+        TVal *v = tarr_get((TArr *)pv.u.p, TV_STR(tstr_intern(k, strlen(k))));
+        if (v && v->t != T_UNDEF && v->t != T_NULL) {
+            tval_addref(*v);
+            return *v;
+        }
     }
     if (n >= 2) {
         TVal d = args[1];
@@ -4094,6 +4409,13 @@ static void teb_register_classes(void) {
     TClass *w = teb_cls_new("Tphp\\Teb\\Web");
     teb_cls_add_prop(w, "ctx");
     teb_cls_add_native(w, "route", (void *)nm_web_route, false);
+    teb_cls_add_native(w, "get", (void *)nm_web_get, false);
+    teb_cls_add_native(w, "post", (void *)nm_web_post, false);
+    teb_cls_add_native(w, "put", (void *)nm_web_put, false);
+    teb_cls_add_native(w, "patch", (void *)nm_web_patch, false);
+    teb_cls_add_native(w, "delete", (void *)nm_web_delete, false);
+    teb_cls_add_native(w, "head", (void *)nm_web_head, false);
+    teb_cls_add_native(w, "options", (void *)nm_web_options, false);
     teb_cls_add_native(w, "notFound", (void *)nm_web_not_found, false);
     teb_cls_add_native(w, "before", (void *)nm_web_before, false);
     teb_cls_add_native(w, "file", (void *)nm_web_file, false);
@@ -4134,6 +4456,8 @@ static void teb_register_classes(void) {
     teb_cls_add_native(rq, "beginStream", (void *)nm_req_begin_stream, false);
     teb_cls_add_native(rq, "queryParams", (void *)nm_req_query_params, false);
     teb_cls_add_native(rq, "queryParam", (void *)nm_req_query_param, false);
+    teb_cls_add_native(rq, "routeParams", (void *)nm_req_route_params, false);
+    teb_cls_add_native(rq, "routeParam", (void *)nm_req_route_param, false);
     teb_cls_add_native(rq, "cookies", (void *)nm_req_cookies, false);
     teb_cls_add_native(rq, "cookie", (void *)nm_req_cookie, false);
     teb_cls_add_native(rq, "json", (void *)nm_req_json, false);
