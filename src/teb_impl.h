@@ -217,8 +217,7 @@ typedef struct {
     bool mu_inited;
     bool aux_locks_inited;     /* ws_frag_mu + sess_locks 一次性初始化 */
     bool shutdown;             /* stop 置位：唤醒全部等待中的 worker */
-    bool draining;             /* 消费者（drain/pool 线程）正在处理一批 */
-    bool pending_stop;         /* draining 中收到 stop → 批末真停 */
+    bool pending_stop;         /* drain 批内收到 stop → 批末真停 */
     bool stop_requested;       /* 非主线程 stop()：只置标志，主线程执行真停 */
     uv_thread_t main_tid;      /* start() 所在线程（stop 线程归属判定） */
     uint64_t config_gen;       /* 配置代数：任一注册发布 +1（池线程重建闭包副本用） */
@@ -342,6 +341,11 @@ void teb_ws_ready_cb(struct mg_connection *conn, void *cbdata);
 int teb_ws_data_cb(struct mg_connection *conn, int bits, char *data,
                    size_t len, void *cbdata);
 void teb_ws_close_cb(const struct mg_connection *conn, void *cbdata);
+/* 当前线程 drain 批深度（0=不在批内；定义于 teb_server.c）。
+ * drain 消费者多线程并发（主线程 mode=0 + 执行池 mode=1），"是否在批内"
+ * 只被本线程的 nm_web_stop 查询——共享 bool 会被并发消费者空泵互清，
+ * 导致 handler 内 stop() 误走直停分支（debug-teb-stop-hang 根因）。 */
+extern _Thread_local int g_teb_drain_depth;
 void teb_drain_mode(VM *vm, int mode);
 void teb_drain_once(VM *vm);
 void teb_register_websocket(void);

@@ -144,7 +144,6 @@ static TVal nm_web_start(VM *vm, void *self, TVal *args, int n) {
     }
     teb_lock();
     g_teb.shutdown = false;
-    g_teb.draining = false;
     g_teb.pending_stop = false;
     g_teb.stop_requested = false;
     uv_mutex_unlock(&g_teb.mu);
@@ -395,7 +394,7 @@ static TVal nm_web_stop(VM *vm, void *self, TVal *args, int n) {
         uv_mutex_unlock(&g_teb.mu);
         return TV_NULL;
     }
-    if (g_teb.draining) {
+    if (g_teb_drain_depth > 0) {   /* 本线程批内（线程局部，见 teb_impl.h） */
         g_teb.pending_stop = true;
         return TV_NULL;
     }

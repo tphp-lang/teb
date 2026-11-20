@@ -1,6 +1,8 @@
 /* teb_server.c - 队列/413/405/thunk/WS civetweb 回调/info 物化/dispatch/WS deliver/frag/drain */
 #include "teb_impl.h"
 
+_Thread_local int g_teb_drain_depth = 0;   /* 见 teb_impl.h 声明处注释 */
+
 /* ---- 队列入队 + 阻塞等待（thunk 与 WS 回调共用；worker 线程） ---- */
 
 static void teb_req_free(TebRequest *req) {
@@ -551,7 +553,7 @@ void teb_drain_mode(VM *vm, int mode) {
     }
     /* mu 内整批标记 taken：此后 shutdown 不得提前放行对应 worker */
     for (TebRequest *t = q; t; t = t->next) t->taken = true;
-    g_teb.draining = true;
+    g_teb_drain_depth++;   /* 线程局部：并发消费者互不清除（见 teb_impl.h） */
     uv_mutex_unlock(&g_teb.mu);
 
     while (q) {
@@ -723,7 +725,7 @@ void teb_drain_mode(VM *vm, int mode) {
     }
 
     teb_lock();
-    g_teb.draining = false;
+    g_teb_drain_depth--;
     bool stop_now = g_teb.pending_stop;
     g_teb.pending_stop = false;
     uv_mutex_unlock(&g_teb.mu);
